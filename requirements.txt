@@ -1,0 +1,5 @@
+psycopg2-binary>=2.9
+PyYAML>=6.0
+openpyxl>=3.1
+requests>=2.31
+apache-airflow>=2.8   # only needed on the Airflow host, not the pipeline venv

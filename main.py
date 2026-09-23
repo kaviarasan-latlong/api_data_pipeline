@@ -1,0 +1,100 @@
+"""
+main.py
+
+Entry point invoked by run_pipeline.sh (in turn triggered by api_dag.py).
+
+    determine window (watermark.py)
+      -> for each chunk (extractor.py):
+            parse (parser.py)
+            geo-enrich (geo_enrichment.py)
+            write (writer.py)
+            advance watermark (watermark.py)
+      -> on window exhaustion: mark SUCCESS, build report (metrics.py),
+         notify (notifier.py)
+      -> on any exception: mark FAILED, re-raise (Airflow surfaces the failure)
+"""
+
+import logging
+import sys
+
+import psycopg2
+
+import config_loader
+import extractor
+import geo_enrichment
+import metrics
+import notifier
+import parser
+import watermark
+import writer
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("main")
+
+
+def run():
+    cfg = config_loader.load_config()
+    pipeline_cfg = cfg["pipeline"]
+    watermark_table = cfg["tables"]["watermark_table"]
+    output_table = cfg["tables"]["output_table"]
+    pipeline_name = pipeline_cfg["name"]
+
+    conn = psycopg2.connect(config_loader.get_db_dsn(cfg))
+
+    try:
+        watermark.ensure_watermark_table(conn, watermark_table)
+        writer.ensure_output_table(conn, output_table)
+
+        window_start, window_end, last_processed_id, is_resume = watermark.get_or_create_window(
+            conn, watermark_table, pipeline_name, pipeline_cfg["window_days"],
+        )
+        logger.info(
+            "%s window %s -> %s (resume=%s, last_processed_id=%s)",
+            pipeline_name, window_start, window_end, is_resume, last_processed_id,
+        )
+
+        totals = {"kept": 0, "dropped_error": 0, "dropped_no_latlong": 0}
+
+        for joined_rows, new_last_processed_id in extractor.iterate_chunks(
+            conn, cfg, window_start, window_end, last_processed_id,
+        ):
+            kept_rows, parse_counts = parser.parse_rows(joined_rows)
+            for k in totals:
+                totals[k] += parse_counts.get(k, 0)
+
+            enriched_rows = geo_enrichment.enrich_rows(conn, cfg, kept_rows)
+            writer.write_rows(conn, cfg, enriched_rows)
+
+            watermark.update_last_processed_id(
+                conn, watermark_table, pipeline_name, window_start, new_last_processed_id,
+            )
+
+        watermark.mark_window_status(conn, watermark_table, pipeline_name, window_start, "SUCCESS")
+        logger.info("Window complete. Totals: %s", totals)
+
+        window_counts = metrics.compute_window_counts(conn, cfg, window_start, window_end)
+        report_path = metrics.update_report_workbook(cfg, window_counts, window_end)
+        run_summary = metrics.build_run_summary(pipeline_name, window_start, window_end, totals, report_path)
+
+        notifier.send_notification(cfg, run_summary)
+
+    except Exception:
+        logger.exception("Pipeline run failed - marking window FAILED for retry/resume.")
+        try:
+            # window_start may not be bound yet if failure happened before get_or_create_window
+            watermark.mark_window_status(conn, watermark_table, pipeline_name, window_start, "FAILED")
+        except NameError:
+            pass
+        raise
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    try:
+        run()
+    except Exception:
+        sys.exit(1)

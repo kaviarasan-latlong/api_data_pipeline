@@ -1,0 +1,20 @@
+{
+  "@type": "MessageCard",
+  "@context": "http://schema.org/extensions",
+  "themeColor": "0076D7",
+  "summary": "latlong_pipeline run complete",
+  "title": "{{pipeline_name}} - window complete",
+  "sections": [
+    {
+      "facts": [
+        { "name": "Window start", "value": "{{window_start}}" },
+        { "name": "Window end", "value": "{{window_end}}" },
+        { "name": "Rows kept", "value": "{{kept}}" },
+        { "name": "Dropped (error, no salvageable lat/long)", "value": "{{dropped_error}}" },
+        { "name": "Dropped (no lat/long found)", "value": "{{dropped_no_latlong}}" },
+        { "name": "Report file", "value": "{{report_path}}" }
+      ],
+      "markdown": true
+    }
+  ]
+}
