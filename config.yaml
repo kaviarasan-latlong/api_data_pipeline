@@ -6,60 +6,61 @@
 # =============================================================================
 
 database:
-  host: "${DB_HOST}"
+  host: "localhost"
   port: 5432
-  dbname: "${DB_NAME}"
-  user: "${DB_USER}"
-  password: "${DB_PASSWORD}"
-  # Used for the server-side COPY / batch writes in writer.py
+  dbname: "admin_area"
+  user: "www-data"
+  password: "krishna_g1r1"
   connect_timeout: 10
 
 pipeline:
-  name: "latlong_extraction_pipeline"
-
-  # Rolling window size processed per DAG run.
+  name: "admin_area_latlong_pipeline"
   window_days: 3
-
-  # Row count pulled from request_logs per extraction loop iteration.
   chunk_size: 75000
 
-  # ---------------------------------------------------------------------
-  # API TYPE FILTER
-  # ---------------------------------------------------------------------
-  # Only rows whose request_logs.api_type is in this list are pulled at all.
-  # This is the ONLY place you need to touch when an API is added/retired
-  # upstream - no code changes required anywhere else in the pipeline.
-  #
-  # Include an api_type here ONLY if it can carry lat/long in EITHER:
-  #   - the request_logs.path column (query params), or
-  #   - the response_logs.data column (response JSON)
-  # APIs that never carry lat/long on either side should be left out so we
-  # don't pay the cost of pulling/joining rows we'll immediately drop.
-  # ---------------------------------------------------------------------
   included_api_types:
-    - geocode
-    - reverse_geocode
-    - autocomplete
-    - place_details
-    - distance_matrix
+    - /v4/isochrone.json
+    - /v4/geofence/contains.json
+    - /v4/geocode.json
+    - /v4/snap.json
+    - /v4/distancematrix.json
+    - /v4/pincode.json
+    - /v4/reverse_geocode.json
+    - /v4/landmarks.json
+    - /v4/directions.json
+    - /v4/distance.json
+    - /v4/geovalidation.json
+    - /v4/search.json
+    - /v4/trips.json
+    - /v4/reverse_geocode_international.json
+    - /v4/geo_cipher.json
+    - /v4/draw_line.json
+    - /v5/search.json
+    - /v5/digipin_encode.json
+    - /v5/digipin_decode.json
+    - /v4/point_of_interest.json
+    - /v4.1/brands/:brand_id/stores_around.json
+    - /v4.1/brands/:brand_id/find.json
+    - /v4.1/brands/:brand_id/search_with_disable.json
+    - /v4.1/brands/:brand_id/stores/:customer_store_id/store_details.json
 
-  # Column names, in case they differ per-environment.
   columns:
     request_logs:
       id: "id"
-      unique_id: "uniqueid"
-      created_date: "created_date"
+      requestid: "requestid"
       api_type: "api_type"
+      api_version: "api_version"
+      bunit_id: "bunit_id"
+      tenant_id: "tenant_id"
       path: "path"
+      query_string: "query_string"
+      created_at: "created_at"
       status: "status"
     response_logs:
-      unique_id: "uniqueid"
+      requestid: "requestid"
       data: "data"
-      status: "status"
+      created_at: "created_at"
 
-  # Regex / JSON-key hints used by parser.py when pulling lat/long out of
-  # the request path (query string) and response JSON body. Extend these
-  # if a new api_type uses different key names.
   latlong_keys:
     request_path_params: ["lat", "lng", "long", "longitude", "latitude"]
     response_json_paths:
@@ -68,36 +69,32 @@ pipeline:
       - "data.long"
       - "data.latitude"
       - "data.longitude"
-      - "data.result.lat"
-      - "data.result.lng"
       - "data.geometry.location.lat"
       - "data.geometry.location.lng"
 
 tables:
-  request_logs: "request_logs"
-  response_logs: "response_logs"
+  request_logs: "logs_aug_2026"
+  response_logs: "response_logs_aug_2026"
+  session_activities: "session_activities_aug_26"
   watermark_table: "pipeline_watermark"
-  output_table: "latlong_extracted"
-  geom_table: "area_geom"      # polygon geometries, one row per area
-  area_table: "area"           # area metadata: a_id, state, district, pincode
+  output_table: "admin_area_enriched_final"
+  geom_table: "aa_geom"
+  area_table: "admin_area"
 
 geo_enrichment:
   geom_table_columns:
-    a_id: "a_id"
-    geom: "geom"          # PostGIS geometry/geography column, SRID 4326
+    a_id: "aa_id"
+    geom: "geom"
   area_table_columns:
-    a_id: "a_id"
-    state: "state"
-    district: "district"
-    pincode: "pincode"
-  batch_size: 5000  # points per ST_Intersects batch query
+    a_id: "id"
+    parent_id: "aa_in_aa_id"
+    display_name: "display_name"
+  batch_size: 5000
 
 output:
   report_dir: "/data/reports/latlong_pipeline"
-  # Workbook has 3 sheets: pincode, district, state - each with hit counts.
-  # Regenerated (overwritten) after every successful window run.
   report_filename_pattern: "latlong_report_{window_end}.xlsx"
 
 notifier:
-  teams_webhook_url: "${TEAMS_WEBHOOK_URL}"
+  teams_webhook_url: ""
   template_path: "./notifier_template.json"

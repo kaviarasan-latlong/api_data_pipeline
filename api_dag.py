@@ -16,7 +16,7 @@ from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.operators.bash import BashOperator
 
-PIPELINE_DIR = "/opt/airflow/pipelines/latlong_pipeline"  # adjust to actual deploy path
+PIPELINE_DIR = "/opt/airflow/pipelines/api_data_pipeline"  # adjust to actual deploy path
 
 default_args = {
     "owner": "data-engineering",
@@ -25,14 +25,14 @@ default_args = {
 }
 
 with DAG(
-    dag_id="latlong_extraction_pipeline",
+    dag_id="admin_area_enrichment_pipeline",
     default_args=default_args,
-    description="Extracts lat/long + geo-enriches request/response logs on a rolling window",
-    schedule="0 2 * * *",  # daily at 02:00 - main.py's watermark decides the actual window
+    description="Extracts lat/long from API logs and geo-enriches them into admin-area hierarchy data",
+    schedule="0 2 * * *",
     start_date=datetime(2026, 1, 1),
     catchup=False,
-    max_active_runs=1,  # never overlap runs against the same watermark row
-    tags=["latlong", "geo", "etl"],
+    max_active_runs=1,
+    tags=["admin_area", "geo", "etl"],
 ) as dag:
 
     run_pipeline = BashOperator(

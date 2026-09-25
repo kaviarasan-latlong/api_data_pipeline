@@ -32,11 +32,12 @@ def _fetch_request_chunk(conn, cfg, window_start, window_end, last_processed_id)
     chunk_size = cfg["pipeline"]["chunk_size"]
 
     sql = f"""
-        SELECT {cols['id']}, {cols['unique_id']}, {cols['created_date']},
-               {cols['api_type']}, {cols['path']}, {cols['status']}
+        SELECT {cols['id']}, {cols['requestid']}, {cols['api_type']}, {cols['api_version']},
+               {cols['bunit_id']}, {cols['tenant_id']}, {cols['path']}, {cols['query_string']},
+               {cols['created_at']}, {cols['status']}
         FROM {tables['request_logs']}
-        WHERE {cols['created_date']} >= %s
-          AND {cols['created_date']} <  %s
+        WHERE {cols['created_at']} >= %s
+          AND {cols['created_at']} < %s
           AND {cols['api_type']} = ANY(%s)
           AND {cols['id']} > %s
         ORDER BY {cols['id']}
@@ -49,34 +50,59 @@ def _fetch_request_chunk(conn, cfg, window_start, window_end, last_processed_id)
     return [
         {
             "id": r[0],
-            "uniqueid": r[1],
-            "created_date": r[2],
-            "api_type": r[3],
-            "request_path": r[4],
-            "request_status": r[5],
+            "requestid": r[1],
+            "api_type": r[2],
+            "api_version": r[3],
+            "bunit_id": r[4],
+            "tenant_id": r[5],
+            "request_path": r[6],
+            "request_query_string": r[7],
+            "created_at": r[8],
+            "request_status": r[9],
         }
         for r in rows
     ]
 
 
-def _fetch_response_batch(conn, cfg, uniqueids):
-    if not uniqueids:
+def _fetch_response_batch(conn, cfg, requestids):
+    if not requestids:
         return {}
 
     tables = cfg["tables"]
     cols = cfg["pipeline"]["columns"]["response_logs"]
 
     sql = f"""
-        SELECT {cols['unique_id']}, {cols['data']}, {cols['status']}
+        SELECT {cols['requestid']}, {cols['data']}, {cols['created_at']}
         FROM {tables['response_logs']}
-        WHERE {cols['unique_id']} = ANY(%s)
+        WHERE {cols['requestid']} = ANY(%s)
     """
     with conn.cursor() as cur:
-        cur.execute(sql, (list(uniqueids),))
+        cur.execute(sql, (list(requestids),))
         rows = cur.fetchall()
 
-    # keyed by uniqueid - one response row expected per request uniqueid
-    return {r[0]: {"response_data": r[1], "response_status": r[2]} for r in rows}
+    return {r[0]: {"response_data": r[1], "response_created_at": r[2], "response_status": None} for r in rows}
+
+
+def _fetch_session_activity_latlng(conn, cfg, requestids):
+    if not requestids:
+        return {}
+
+    tables = cfg["tables"]
+    sql = f"""
+        SELECT requestid, searched_latitude, searched_longitude
+        FROM {tables['session_activities']}
+        WHERE requestid = ANY(%s)
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, (list(requestids),))
+        rows = cur.fetchall()
+
+    result = {}
+    for req_id, lat, lng in rows:
+        if lat is None or lng is None:
+            continue
+        result[req_id] = {"lat": float(lat), "lng": float(lng)}
+    return result
 
 
 def iterate_chunks(conn, cfg, window_start, window_end, start_last_processed_id) -> Iterator[tuple[list[dict], int]]:
@@ -92,12 +118,20 @@ def iterate_chunks(conn, cfg, window_start, window_end, start_last_processed_id)
             logger.info("No more rows in window after id=%s - window exhausted.", last_processed_id)
             return
 
-        uniqueids = [r["uniqueid"] for r in request_rows]
-        response_by_id = _fetch_response_batch(conn, cfg, uniqueids)
+        requestids = [r["requestid"] for r in request_rows]
+        response_by_id = _fetch_response_batch(conn, cfg, requestids)
+        session_latlng_by_id = _fetch_session_activity_latlng(conn, cfg, requestids)
 
         joined = []
         for req in request_rows:
-            resp = response_by_id.get(req["uniqueid"], {})
+            resp = response_by_id.get(req["requestid"], {})
+            session_latlng = session_latlng_by_id.get(req["requestid"])
+            if session_latlng and req["api_type"] in {
+                "/v4.1/brands/:brand_id/stores_around.json",
+                "/v4.1/brands/:brand_id/find.json",
+                "/v4.1/brands/:brand_id/search_with_disable.json",
+            }:
+                resp = {**resp, "lat": session_latlng["lat"], "lng": session_latlng["lng"]}
             joined.append({**req, **resp})
 
         new_last_processed_id = request_rows[-1]["id"]

@@ -1,16 +1,14 @@
 """
 geo_enrichment.py  -  STAGE 2: GEO ENRICHMENT
 
-Rows that already have state/district/pincode (pulled directly out of the
-API payload in Stage 1) are left untouched. Everything else gets a
-lat/long -> Point -> ST_Intersects lookup against the area geometry table,
-then a join to the area table for the human-readable state/district/pincode.
-
-Batched: builds one ST_Intersects query per `batch_size` rows (via UNNEST)
-instead of one query per row, since a chunk can be 50-100k rows.
+The server schema uses aa_geom + admin_area hierarchy. We match the point
+against aa_geom, then walk the parent chain in admin_area to derive the
+pincode -> district -> state names. If a pincode is already present in the API
+response, the row is kept as-is.
 """
 
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -19,10 +17,87 @@ def _needs_enrichment(row):
     return not (row.get("state") and row.get("district") and row.get("pincode"))
 
 
+def _clean_area_name(value):
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return re.sub(r"^\d{6}\s*[-–]?\s*", "", text).strip()
+
+
+def _parse_pincode(value):
+    if value is None:
+        return None
+    match = re.match(r"^\s*(\d{6})\s*(?:[-–]\s*.*)?$", str(value).strip())
+    if not match:
+        return None
+    return match.group(1)
+
+
+def _resolve_admin_hierarchy(conn, cfg, start_area_id):
+    area_cols = cfg["geo_enrichment"]["area_table_columns"]
+    parent_col = area_cols.get("parent_id", "aa_in_aa_id")
+    display_col = area_cols.get("display_name", "display_name")
+    a_id_col = area_cols.get("a_id", "id")
+    area_table = cfg["tables"]["area_table"]
+
+    names = []
+    seen = set()
+    current_id = start_area_id
+
+    while current_id is not None and current_id not in seen:
+        seen.add(current_id)
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT {a_id_col}, {display_col}, {parent_col} FROM {area_table} WHERE {a_id_col} = %s LIMIT 1",
+                (current_id,),
+            )
+            row = cur.fetchone()
+        if not row:
+            break
+        names.append(str(row[1]).strip())
+        current_id = row[2]
+
+    pincode = None
+    district = None
+    state = None
+
+    for name in names:
+        parsed = _parse_pincode(name)
+        if pincode is None and parsed:
+            pincode = parsed
+            continue
+        if pincode and district is None:
+            district = _clean_area_name(name)
+            continue
+        if district and state is None:
+            state = _clean_area_name(name)
+            break
+
+    if pincode is None and names:
+        district = _clean_area_name(names[0])
+        if len(names) > 1:
+            state = _clean_area_name(names[1])
+
+    return {
+        "pincode": pincode,
+        "district": district,
+        "state": state,
+    }
+
+
 def _enrich_batch(conn, cfg, batch: list[dict]):
     tables = cfg["tables"]
     geo_cols = cfg["geo_enrichment"]["geom_table_columns"]
     area_cols = cfg["geo_enrichment"]["area_table_columns"]
+    area_table = tables["area_table"]
+    geom_table = tables["geom_table"]
+    area_id_col = area_cols.get("a_id", "id")
+    parent_id_col = area_cols.get("parent_id", "aa_in_aa_id")
+    display_name_col = area_cols.get("display_name", "display_name")
+    geom_col = geo_cols["geom"]
+    geom_a_id_col = geo_cols["a_id"]
 
     idxs = list(range(len(batch)))
     lats = [r["lat"] for r in batch]
@@ -33,22 +108,31 @@ def _enrich_batch(conn, cfg, batch: list[dict]):
             SELECT * FROM UNNEST(%s::int[], %s::float8[], %s::float8[]) AS t(idx, lat, lng)
         )
         SELECT pts.idx,
-               area.{area_cols['pincode']},
-               area.{area_cols['district']},
-               area.{area_cols['state']}
+               g.{geom_a_id_col},
+               a.{area_id_col},
+               a.{display_name_col},
+               a.{parent_id_col}
         FROM pts
-        JOIN {tables['geom_table']} g
-            ON ST_Intersects(g.{geo_cols['geom']},
-                              ST_SetSRID(ST_MakePoint(pts.lng, pts.lat), 4326))
-        JOIN {tables['area_table']} area
-            ON area.{area_cols['a_id']} = g.{geo_cols['a_id']}
+        JOIN {geom_table} g
+          ON ST_Intersects(g.{geom_col}, ST_SetSRID(ST_MakePoint(pts.lng, pts.lat), 4326))
+        JOIN {area_table} a
+          ON a.{area_id_col} = g.{geom_a_id_col}
+        ORDER BY pts.idx
     """
     with conn.cursor() as cur:
         cur.execute(sql, (idxs, lats, lngs))
         results = cur.fetchall()
 
-    by_idx = {r[0]: {"pincode": r[1], "district": r[2], "state": r[3]} for r in results}
-    return by_idx
+    by_idx = {}
+    for row in results:
+        idx = row[0]
+        if idx not in by_idx:
+            by_idx[idx] = row[1]
+
+    resolved = {}
+    for idx, area_id in by_idx.items():
+        resolved[idx] = _resolve_admin_hierarchy(conn, cfg, area_id)
+    return resolved
 
 
 def enrich_rows(conn, cfg, rows: list[dict]):
@@ -69,9 +153,9 @@ def enrich_rows(conn, cfg, rows: list[dict]):
             if not geo:
                 continue
             row = rows[global_idx]
-            row["pincode"] = row.get("pincode") or geo["pincode"]
-            row["district"] = row.get("district") or geo["district"]
-            row["state"] = row.get("state") or geo["state"]
+            row["pincode"] = row.get("pincode") or geo.get("pincode")
+            row["district"] = row.get("district") or geo.get("district")
+            row["state"] = row.get("state") or geo.get("state")
             enriched_count += 1
 
     logger.info(

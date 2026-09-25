@@ -38,10 +38,9 @@ def compute_window_counts(conn, cfg, window_start, window_end):
             cur.execute(f"""
                 SELECT {field}, COUNT(*)
                 FROM {tables['output_table']}
-                WHERE created_date >= %s AND created_date < %s
-                  AND {field} IS NOT NULL
+                WHERE {field} IS NOT NULL
                 GROUP BY {field}
-            """, (window_start, window_end))
+            """)
             counts[field] = Counter(dict(cur.fetchall()))
     return counts
 

@@ -155,7 +155,8 @@ def parse_rows(rows: list[dict]):
     kept = []
 
     for row in rows:
-        request_latlong, request_fields = _extract_from_path(row.get("request_path"))
+        request_path = row.get("request_path") or row.get("request_query_string") or ""
+        request_latlong, request_fields = _extract_from_path(request_path)
         is_error = _is_error_response(row)
 
         if is_error:
@@ -163,7 +164,6 @@ def parse_rows(rows: list[dict]):
         else:
             response_latlong, response_fields = _extract_from_response(row.get("response_data"))
 
-        # response-wins-on-conflict
         final_latlong = response_latlong or request_latlong
 
         if final_latlong is None:
@@ -173,12 +173,16 @@ def parse_rows(rows: list[dict]):
                 counts["dropped_no_latlong"] += 1
             continue
 
-        merged_fields = {**request_fields, **response_fields}  # response wins here too
+        merged_fields = {**request_fields, **response_fields}
 
         kept.append({
             **row,
             "lat": final_latlong[0],
             "lng": final_latlong[1],
+            "bunit_id": row.get("bunit_id"),
+            "tenant_id": row.get("tenant_id"),
+            "api_type": row.get("api_type"),
+            "api_version": row.get("api_version"),
             "pincode": merged_fields.get("pincode"),
             "district": merged_fields.get("district"),
             "state": merged_fields.get("state"),
