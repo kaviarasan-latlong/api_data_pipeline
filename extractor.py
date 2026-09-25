@@ -83,25 +83,30 @@ def _fetch_response_batch(conn, cfg, requestids):
     return {r[0]: {"response_data": r[1], "response_created_at": r[2], "response_status": None} for r in rows}
 
 
-def _fetch_session_activity_latlng(conn, cfg, requestids):
-    if not requestids:
+def _fetch_session_activity_latlng(conn, cfg, request_rows):
+    if not request_rows:
         return {}
 
     tables = cfg["tables"]
+    request_ids = [r["id"] for r in request_rows if r.get("id") is not None]
+    if not request_ids:
+        return {}
+
     sql = f"""
-        SELECT requestid, searched_latitude, searched_longitude
+        SELECT id, session_id, searched_latitude, searched_longitude
         FROM {tables['session_activities']}
-        WHERE requestid = ANY(%s)
+        WHERE id = ANY(%s)
     """
     with conn.cursor() as cur:
-        cur.execute(sql, (list(requestids),))
+        cur.execute(sql, (list(request_ids),))
         rows = cur.fetchall()
 
     result = {}
-    for req_id, lat, lng in rows:
+    for row_id, session_id, lat, lng in rows:
         if lat is None or lng is None:
             continue
-        result[req_id] = {"lat": float(lat), "lng": float(lng)}
+        result[int(row_id)] = {"lat": float(lat), "lng": float(lng)}
+
     return result
 
 
@@ -120,12 +125,12 @@ def iterate_chunks(conn, cfg, window_start, window_end, start_last_processed_id)
 
         requestids = [r["requestid"] for r in request_rows]
         response_by_id = _fetch_response_batch(conn, cfg, requestids)
-        session_latlng_by_id = _fetch_session_activity_latlng(conn, cfg, requestids)
+        session_latlng_by_id = _fetch_session_activity_latlng(conn, cfg, request_rows)
 
         joined = []
         for req in request_rows:
             resp = response_by_id.get(req["requestid"], {})
-            session_latlng = session_latlng_by_id.get(req["requestid"])
+            session_latlng = session_latlng_by_id.get(req["id"])
             if session_latlng and req["api_type"] in {
                 "/v4.1/brands/:brand_id/stores_around.json",
                 "/v4.1/brands/:brand_id/find.json",
