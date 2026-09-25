@@ -14,6 +14,7 @@ Entry point invoked by run_pipeline.sh (in turn triggered by api_dag.py).
       -> on any exception: mark FAILED, re-raise (Airflow surfaces the failure)
 """
 
+import atexit
 import logging
 import os
 import sys
@@ -44,6 +45,32 @@ def _write_error_ids_file(path: str, ids: list):
                 fh.write(f"{value}\n")
 
 
+def _cleanup_idle_postgres_sessions(conn):
+    if conn is None:
+        return
+    try:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT pg_terminate_backend(pid)
+                FROM pg_stat_activity
+                WHERE datname = current_database()
+                  AND pid <> pg_backend_pid()
+                  AND state IN ('idle', 'idle in transaction')
+                """
+            )
+            rows = cur.fetchall()
+            if rows:
+                logger.info("Terminated idle PostgreSQL sessions: %s", rows)
+    except Exception:
+        logger.exception("Failed to terminate idle PostgreSQL sessions.")
+
+
 def run():
     cfg = config_loader.load_config()
     pipeline_cfg = cfg["pipeline"]
@@ -53,6 +80,7 @@ def run():
     error_dir = cfg["output"]["report_dir"]
 
     conn = psycopg2.connect(config_loader.get_db_dsn(cfg))
+    atexit.register(_cleanup_idle_postgres_sessions, conn)
 
     try:
         watermark.ensure_watermark_table(conn, watermark_table)
@@ -115,6 +143,7 @@ def run():
             pass
         raise
     finally:
+        _cleanup_idle_postgres_sessions(conn)
         conn.close()
 
 
