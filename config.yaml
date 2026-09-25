@@ -18,6 +18,7 @@ pipeline:
   window_days: 3
   start_date: "2026-08-01T00:00:00+05:30"
   chunk_size: 75000
+  parallel_workers: 4
 
   included_api_types:
     - /v4/isochrone.json

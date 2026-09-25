@@ -175,7 +175,11 @@ def iterate_chunks(conn, cfg, window_start, window_end, start_last_processed_id)
             [request_rows[-1]["id"], max((sr["id"] for sr in session_rows), default=0)]
         )
         logger.info(
-            "Fetched chunk of %d rows (ids %s..%s), %d matched responses.",
-            len(request_rows), request_rows[0]["id"], new_last_processed_id, len(response_by_id),
+            "Fetched normal chunk of %d rows (ids %s..%s), %d matched responses, %d session-only rows added.",
+            len(request_rows),
+            request_rows[0]["id"],
+            new_last_processed_id,
+            len(response_by_id),
+            len(session_rows),
         )
         yield joined, new_last_processed_id

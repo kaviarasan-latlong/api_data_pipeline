@@ -16,8 +16,10 @@ Entry point invoked by run_pipeline.sh (in turn triggered by api_dag.py).
 
 import atexit
 import logging
+import math
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 
 import psycopg2
 
@@ -37,9 +39,9 @@ logging.basicConfig(
 logger = logging.getLogger("main")
 
 
-def _write_error_ids_file(path: str, ids: list):
+def _write_error_ids_file(path: str, ids: list, mode: str = "w"):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8") as fh:
+    with open(path, mode, encoding="utf-8") as fh:
         for value in ids:
             if value is not None:
                 fh.write(f"{value}\n")
@@ -69,6 +71,40 @@ def _cleanup_idle_postgres_sessions(conn):
                 logger.info("Terminated idle PostgreSQL sessions: %s", rows)
     except Exception:
         logger.exception("Failed to terminate idle PostgreSQL sessions.")
+
+
+def _enrich_rows_in_worker(cfg, rows):
+    conn = psycopg2.connect(config_loader.get_db_dsn(cfg))
+    try:
+        return geo_enrichment.enrich_rows(conn, cfg, rows)
+    finally:
+        conn.close()
+
+
+def _parallel_enrich_rows(cfg, rows, max_workers):
+    if not rows:
+        return []
+    if max_workers <= 1:
+        conn = psycopg2.connect(config_loader.get_db_dsn(cfg))
+        try:
+            return geo_enrichment.enrich_rows(conn, cfg, rows)
+        finally:
+            conn.close()
+
+    target_batches = min(max_workers, len(rows))
+    batch_size = max(1, math.ceil(len(rows) / target_batches))
+    batches = [rows[i:i + batch_size] for i in range(0, len(rows), batch_size)]
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(_enrich_rows_in_worker, cfg, batch) for batch in batches]
+        ordered = [None] * len(batches)
+        for idx, future in enumerate(futures):
+            ordered[idx] = future.result()
+
+    merged = []
+    for batch_rows in ordered:
+        merged.extend(batch_rows)
+    return merged
 
 
 def run():
@@ -113,7 +149,25 @@ def run():
             all_error_ids.extend(dropped_error_ids)
             all_no_latlong_ids.extend(dropped_no_latlong_ids)
 
-            enriched_rows = geo_enrichment.enrich_rows(conn, cfg, kept_rows)
+            if dropped_error_ids:
+                _write_error_ids_file(
+                    os.path.join(error_dir, "response_error_ids.txt"),
+                    dropped_error_ids,
+                    mode="a",
+                )
+            if dropped_no_latlong_ids:
+                _write_error_ids_file(
+                    os.path.join(error_dir, "no_latlong_error_ids.txt"),
+                    dropped_no_latlong_ids,
+                    mode="a",
+                )
+
+            workers = max(1, int(pipeline_cfg.get("parallel_workers", 1)))
+            if len(kept_rows) > 5000 and workers > 1:
+                enriched_rows = _parallel_enrich_rows(cfg, kept_rows, workers)
+            else:
+                enriched_rows = geo_enrichment.enrich_rows(conn, cfg, kept_rows)
+
             writer.write_rows(conn, cfg, enriched_rows)
 
             watermark.update_last_processed_id(
