@@ -15,6 +15,7 @@ Entry point invoked by run_pipeline.sh (in turn triggered by api_dag.py).
 """
 
 import logging
+import os
 import sys
 
 import psycopg2
@@ -35,12 +36,21 @@ logging.basicConfig(
 logger = logging.getLogger("main")
 
 
+def _write_error_ids_file(path: str, ids: list):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        for value in ids:
+            if value is not None:
+                fh.write(f"{value}\n")
+
+
 def run():
     cfg = config_loader.load_config()
     pipeline_cfg = cfg["pipeline"]
     watermark_table = cfg["tables"]["watermark_table"]
     output_table = cfg["tables"]["output_table"]
     pipeline_name = pipeline_cfg["name"]
+    error_dir = cfg["output"]["report_dir"]
 
     conn = psycopg2.connect(config_loader.get_db_dsn(cfg))
 
@@ -63,13 +73,17 @@ def run():
         )
 
         totals = {"kept": 0, "dropped_error": 0, "dropped_no_latlong": 0}
+        all_error_ids = []
+        all_no_latlong_ids = []
 
         for joined_rows, new_last_processed_id in extractor.iterate_chunks(
             conn, cfg, window_start, window_end, last_processed_id,
         ):
-            kept_rows, parse_counts = parser.parse_rows(joined_rows)
+            kept_rows, parse_counts, dropped_error_ids, dropped_no_latlong_ids = parser.parse_rows(joined_rows)
             for k in totals:
                 totals[k] += parse_counts.get(k, 0)
+            all_error_ids.extend(dropped_error_ids)
+            all_no_latlong_ids.extend(dropped_no_latlong_ids)
 
             enriched_rows = geo_enrichment.enrich_rows(conn, cfg, kept_rows)
             writer.write_rows(conn, cfg, enriched_rows)
@@ -77,6 +91,11 @@ def run():
             watermark.update_last_processed_id(
                 conn, watermark_table, pipeline_name, window_start, new_last_processed_id,
             )
+
+        if all_error_ids:
+            _write_error_ids_file(os.path.join(error_dir, "response_error_ids.txt"), all_error_ids)
+        if all_no_latlong_ids:
+            _write_error_ids_file(os.path.join(error_dir, "no_latlong_error_ids.txt"), all_no_latlong_ids)
 
         watermark.mark_window_status(conn, watermark_table, pipeline_name, window_start, "SUCCESS")
         logger.info("Window complete. Totals: %s", totals)

@@ -75,10 +75,12 @@ def _resolve_admin_hierarchy(conn, cfg, start_area_id):
             state = _clean_area_name(name)
             break
 
-    if pincode is None and names:
-        district = _clean_area_name(names[0])
-        if len(names) > 1:
-            state = _clean_area_name(names[1])
+    # Do not invent district/state when the geometry lookup does not produce a
+    # valid pincode-bearing area. This prevents wrong labels like Dhurali/Sunam
+    # from being assigned to a point that matched a nearby polygon but not the
+    # exact pincode-bearing admin chain.
+    if pincode is None:
+        return {"pincode": None, "district": None, "state": None}
 
     return {
         "pincode": pincode,

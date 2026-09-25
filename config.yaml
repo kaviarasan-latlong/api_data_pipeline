@@ -40,10 +40,11 @@ pipeline:
     - /v5/digipin_encode.json
     - /v5/digipin_decode.json
     - /v4/point_of_interest.json
+
+  session_only_api_types:
     - /v4.1/brands/:brand_id/stores_around.json
     - /v4.1/brands/:brand_id/find.json
     - /v4.1/brands/:brand_id/search_with_disable.json
-    - /v4.1/brands/:brand_id/stores/:customer_store_id/store_details.json
 
   columns:
     request_logs:

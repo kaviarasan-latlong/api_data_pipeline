@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 
 LAT_KEY_RE = re.compile(r"^(lat|latitude)$", re.IGNORECASE)
 LNG_KEY_RE = re.compile(r"^(lng|lon|long|longitude)$", re.IGNORECASE)
+POINT_RE = re.compile(r"POINT\s*\(\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s+([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*\)", re.IGNORECASE)
 
 FIELD_KEY_RE = {
     "pincode": re.compile(r"^(pincode|pin_code|postal_code|zip|zipcode)$", re.IGNORECASE),
@@ -54,6 +55,15 @@ def _as_float(v):
         return None
 
 
+def _extract_point_latlng(value):
+    if not isinstance(value, str):
+        return None
+    match = POINT_RE.search(value)
+    if not match:
+        return None
+    return (float(match.group(1)), float(match.group(2)))
+
+
 def _find_latlong_in_obj(obj):
     """Recursively search a dict/list for a dict level holding both a
     lat-ish and lng-ish key (e.g. {"lat":.., "lng":..} or nested under
@@ -66,6 +76,10 @@ def _find_latlong_in_obj(obj):
                     lat = _as_float(v)
                 elif LNG_KEY_RE.match(str(k)):
                     lng = _as_float(v)
+            elif isinstance(v, str):
+                point = _extract_point_latlng(v)
+                if point is not None and lat is None and lng is None:
+                    return point
         if lat is not None and lng is not None:
             return (lat, lng)
         for v in obj.values():
@@ -150,8 +164,10 @@ def _is_error_response(row):
 
 
 def parse_rows(rows: list[dict]):
-    """Returns (kept_rows, counts) where counts = {dropped_error, dropped_no_latlong, kept}."""
+    """Returns (kept_rows, counts, dropped_error_ids, dropped_no_latlong_ids)."""
     counts = {"dropped_error": 0, "dropped_no_latlong": 0, "kept": 0}
+    dropped_error_ids = []
+    dropped_no_latlong_ids = []
     kept = []
 
     for row in rows:
@@ -164,13 +180,20 @@ def parse_rows(rows: list[dict]):
         else:
             response_latlong, response_fields = _extract_from_response(row.get("response_data"))
 
-        final_latlong = response_latlong or request_latlong
+        session_lat = row.get("lat")
+        session_lng = row.get("lng")
+        if session_lat is not None and session_lng is not None:
+            final_latlong = (float(session_lat), float(session_lng))
+        else:
+            final_latlong = response_latlong or request_latlong
 
         if final_latlong is None:
             if is_error:
                 counts["dropped_error"] += 1
+                dropped_error_ids.append(row.get("session_id") or row.get("requestid") or row.get("id"))
             else:
                 counts["dropped_no_latlong"] += 1
+                dropped_no_latlong_ids.append(row.get("session_id") or row.get("requestid") or row.get("id"))
             continue
 
         merged_fields = {**request_fields, **response_fields}
@@ -192,4 +215,4 @@ def parse_rows(rows: list[dict]):
         counts["kept"] += 1
 
     logger.info("Stage 1 parse: %s", counts)
-    return kept, counts
+    return kept, counts, dropped_error_ids, dropped_no_latlong_ids

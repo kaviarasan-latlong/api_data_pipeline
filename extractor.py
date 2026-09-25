@@ -20,9 +20,28 @@ after each chunk is fully processed (extract -> parse -> enrich -> write).
 """
 
 import logging
+import re
 from typing import Iterator
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_bunit_id_from_path(path: str | None):
+    if not path:
+        return None
+    match = re.search(r"/brands/(\d+)(?:/|\.|\?|$)", str(path))
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def _extract_api_version(api_type: str | None):
+    if not api_type:
+        return None
+    match = re.search(r"/v(\d+\.\d+)", str(api_type))
+    if not match:
+        return None
+    return f"v{match.group(1)}"
 
 
 def _fetch_request_chunk(conn, cfg, window_start, window_end, last_processed_id):
@@ -83,30 +102,42 @@ def _fetch_response_batch(conn, cfg, requestids):
     return {r[0]: {"response_data": r[1], "response_created_at": r[2], "response_status": None} for r in rows}
 
 
-def _fetch_session_activity_latlng(conn, cfg, request_rows):
-    if not request_rows:
-        return {}
+def _fetch_session_activity_chunk(conn, cfg, window_start, window_end):
+    session_api_types = tuple(cfg["pipeline"].get("session_only_api_types", []))
+    if not session_api_types:
+        return []
 
     tables = cfg["tables"]
-    request_ids = [r["id"] for r in request_rows if r.get("id") is not None]
-    if not request_ids:
-        return {}
-
     sql = f"""
-        SELECT id, session_id, searched_latitude, searched_longitude
+        SELECT id, session_id, api_type, path, query_string, searched_latitude, searched_longitude, created_at, status
         FROM {tables['session_activities']}
-        WHERE id = ANY(%s)
+        WHERE api_type = ANY(%s)
+          AND created_at >= %s
+          AND created_at < %s
     """
     with conn.cursor() as cur:
-        cur.execute(sql, (list(request_ids),))
+        cur.execute(sql, (list(session_api_types), window_start, window_end))
         rows = cur.fetchall()
 
-    result = {}
-    for row_id, session_id, lat, lng in rows:
+    result = []
+    for row in rows:
+        row_id, session_id, api_type, path, query_string, lat, lng, created_at, status = row
         if lat is None or lng is None:
             continue
-        result[int(row_id)] = {"lat": float(lat), "lng": float(lng)}
-
+        result.append({
+            "id": row_id,
+            "session_id": session_id,
+            "api_type": api_type,
+            "bunit_id": _extract_bunit_id_from_path(path),
+            "api_version": _extract_api_version(api_type),
+            "tenant_id": None,
+            "request_path": path,
+            "request_query_string": query_string,
+            "created_at": created_at,
+            "request_status": status,
+            "lat": float(lat),
+            "lng": float(lng),
+        })
     return result
 
 
@@ -125,21 +156,24 @@ def iterate_chunks(conn, cfg, window_start, window_end, start_last_processed_id)
 
         requestids = [r["requestid"] for r in request_rows]
         response_by_id = _fetch_response_batch(conn, cfg, requestids)
-        session_latlng_by_id = _fetch_session_activity_latlng(conn, cfg, request_rows)
+        session_rows = _fetch_session_activity_chunk(conn, cfg, window_start, window_end)
 
         joined = []
         for req in request_rows:
             resp = response_by_id.get(req["requestid"], {})
-            session_latlng = session_latlng_by_id.get(req["id"])
-            if session_latlng and req["api_type"] in {
-                "/v4.1/brands/:brand_id/stores_around.json",
-                "/v4.1/brands/:brand_id/find.json",
-                "/v4.1/brands/:brand_id/search_with_disable.json",
-            }:
-                resp = {**resp, "lat": session_latlng["lat"], "lng": session_latlng["lng"]}
             joined.append({**req, **resp})
 
-        new_last_processed_id = request_rows[-1]["id"]
+        for session_row in session_rows:
+            joined.append({
+                **session_row,
+                "requestid": None,
+                "response_data": None,
+                "response_status": None,
+            })
+
+        new_last_processed_id = max(
+            [request_rows[-1]["id"], max((sr["id"] for sr in session_rows), default=0)]
+        )
         logger.info(
             "Fetched chunk of %d rows (ids %s..%s), %d matched responses.",
             len(request_rows), request_rows[0]["id"], new_last_processed_id, len(response_by_id),
