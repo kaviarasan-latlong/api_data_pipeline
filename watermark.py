@@ -42,17 +42,18 @@ def ensure_watermark_table(conn, table: str):
 
 
 def get_or_create_window(conn, table: str, pipeline_name: str, window_days: int,
-                        request_table: str | None = None, created_at_col: str = "created_at"):
+                        request_table: str | None = None, created_at_col: str = "created_at",
+                        start_date: dt.datetime | str | None = None):
     """
     Returns (window_start, window_end, last_processed_id, is_resume: bool)
 
-    - If the most recent row for this pipeline is still RUNNING, resume it
-      (crash recovery) using its stored last_processed_id.
-    - Otherwise start a new window immediately after the last SUCCESS
-      window_end.
-    - If there is no history yet and the source log table exists, start from
-      the minimum timestamp in that table so a first run tests the earliest
-      3-day slice instead of defaulting to "now - 3 days".
+    - If the most recent row for this pipeline is still RUNNING, resume it.
+    - Otherwise, a fresh run starts from the provided start_date (if set),
+      otherwise from the earliest source row, else from now - window_days.
+
+    The window_end is always start + window_days and the extractor queries
+    created_at < window_end, so a 3-day window covers the full final day up to
+    23:59:59.999 without needing a literal "23:59:59" timestamp.
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -76,10 +77,14 @@ def get_or_create_window(conn, table: str, pipeline_name: str, window_days: int,
         return window_start, window_end, last_processed_id, True
 
     if row:
-        window_start = row[1]  # previous window_end becomes new window_start
+        window_start = row[1]
     else:
-        window_start = dt.datetime.utcnow() - dt.timedelta(days=window_days)
-        if request_table:
+        if start_date is not None:
+            if isinstance(start_date, str):
+                window_start = dt.datetime.fromisoformat(start_date)
+            else:
+                window_start = start_date
+        elif request_table:
             with conn.cursor() as cur:
                 cur.execute(
                     f"SELECT MIN({created_at_col}) FROM {request_table}",
@@ -87,6 +92,10 @@ def get_or_create_window(conn, table: str, pipeline_name: str, window_days: int,
                 min_created = cur.fetchone()[0]
             if min_created is not None:
                 window_start = min_created
+            else:
+                window_start = dt.datetime.utcnow() - dt.timedelta(days=window_days)
+        else:
+            window_start = dt.datetime.utcnow() - dt.timedelta(days=window_days)
 
     window_end = window_start + dt.timedelta(days=window_days)
 

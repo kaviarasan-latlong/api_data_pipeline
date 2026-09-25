@@ -55,6 +55,7 @@ def run():
             pipeline_cfg["window_days"],
             request_table=cfg["tables"]["request_logs"],
             created_at_col="created_at",
+            start_date=pipeline_cfg.get("start_date"),
         )
         logger.info(
             "%s window %s -> %s (resume=%s, last_processed_id=%s)",

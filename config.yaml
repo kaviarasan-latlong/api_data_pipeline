@@ -16,6 +16,7 @@ database:
 pipeline:
   name: "admin_area_latlong_pipeline"
   window_days: 3
+  start_date: "2026-08-01T00:00:00+05:30"
   chunk_size: 75000
 
   included_api_types:
