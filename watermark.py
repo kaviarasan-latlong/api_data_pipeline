@@ -41,14 +41,18 @@ def ensure_watermark_table(conn, table: str):
     conn.commit()
 
 
-def get_or_create_window(conn, table: str, pipeline_name: str, window_days: int):
+def get_or_create_window(conn, table: str, pipeline_name: str, window_days: int,
+                        request_table: str | None = None, created_at_col: str = "created_at"):
     """
     Returns (window_start, window_end, last_processed_id, is_resume: bool)
 
     - If the most recent row for this pipeline is still RUNNING, resume it
       (crash recovery) using its stored last_processed_id.
     - Otherwise start a new window immediately after the last SUCCESS
-      window_end (or `now - window_days` if there's no history at all).
+      window_end.
+    - If there is no history yet and the source log table exists, start from
+      the minimum timestamp in that table so a first run tests the earliest
+      3-day slice instead of defaulting to "now - 3 days".
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -75,6 +79,14 @@ def get_or_create_window(conn, table: str, pipeline_name: str, window_days: int)
         window_start = row[1]  # previous window_end becomes new window_start
     else:
         window_start = dt.datetime.utcnow() - dt.timedelta(days=window_days)
+        if request_table:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT MIN({created_at_col}) FROM {request_table}",
+                )
+                min_created = cur.fetchone()[0]
+            if min_created is not None:
+                window_start = min_created
 
     window_end = window_start + dt.timedelta(days=window_days)
 

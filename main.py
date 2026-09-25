@@ -49,7 +49,12 @@ def run():
         writer.ensure_output_table(conn, output_table)
 
         window_start, window_end, last_processed_id, is_resume = watermark.get_or_create_window(
-            conn, watermark_table, pipeline_name, pipeline_cfg["window_days"],
+            conn,
+            watermark_table,
+            pipeline_name,
+            pipeline_cfg["window_days"],
+            request_table=cfg["tables"]["request_logs"],
+            created_at_col="created_at",
         )
         logger.info(
             "%s window %s -> %s (resume=%s, last_processed_id=%s)",
