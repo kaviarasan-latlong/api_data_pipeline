@@ -14,7 +14,7 @@ database:
   connect_timeout: 10
 
 pipeline:
-  name: "admin_area_latlong_pipeline"
+  name: "api_data_pipeline"
   window_days: 3
   start_date: "2026-08-01T00:00:00+05:30"
   chunk_size: 75000
@@ -93,8 +93,8 @@ geo_enrichment:
   batch_size: 5000
 
 output:
-  report_dir: "/data/reports/latlong_pipeline"
-  report_filename_pattern: "latlong_report_{window_end}.xlsx"
+  report_dir: "/var/www/kaviarasan/api_data_pipeline"
+  report_filename_pattern: "api_data_pipeline_report.xlsx"
 
 notifier:
   teams_webhook_url: ""
