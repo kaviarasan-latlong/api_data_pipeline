@@ -82,6 +82,19 @@ def _extract_first_coordinate_pair(value):
     return None
 
 
+def _extract_first_origin_or_first_pair(params):
+    for key in ["origins", "origin", "source", "path"]:
+        if key in params:
+            pair = _extract_first_coordinate_pair(params[key])
+            if pair is not None:
+                return pair
+    for value in params.values():
+        pair = _extract_first_coordinate_pair(value)
+        if pair is not None:
+            return pair
+    return None
+
+
 def _find_latlong_in_obj(obj):
     """Recursively search a dict/list for a dict level holding both a
     lat-ish and lng-ish key (e.g. {"lat":.., "lng":..} or nested under
@@ -148,11 +161,9 @@ def _extract_from_path(path: str):
             lng = _as_float(v)
 
     if lat is None or lng is None:
-        for v in params.values():
-            pair = _extract_first_coordinate_pair(v)
-            if pair is not None:
-                lat, lng = pair
-                break
+        pair = _extract_first_origin_or_first_pair(params)
+        if pair is not None:
+            lat, lng = pair
 
     latlong = (lat, lng) if lat is not None and lng is not None else None
     fields = _find_fields_in_obj(params)

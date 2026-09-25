@@ -185,16 +185,32 @@ def run():
         window_counts = metrics.compute_window_counts(conn, cfg, window_start, window_end)
         report_path = metrics.update_report_workbook(cfg, window_counts, window_end)
         run_summary = metrics.build_run_summary(pipeline_name, window_start, window_end, totals, report_path)
-
+        run_summary["output_table"] = output_table
         notifier.send_notification(cfg, run_summary)
 
-    except Exception:
+    except Exception as exc:
         logger.exception("Pipeline run failed - marking window FAILED for retry/resume.")
         try:
-            # window_start may not be bound yet if failure happened before get_or_create_window
-            watermark.mark_window_status(conn, watermark_table, pipeline_name, window_start, "FAILED")
-        except NameError:
+            if "window_start" in locals():
+                watermark.mark_window_status(conn, watermark_table, pipeline_name, window_start, "FAILED")
+        except Exception:
             pass
+
+        failure_summary = {
+            "pipeline_name": pipeline_name,
+            "window_start": str(locals().get("window_start", "n/a")),
+            "window_end": str(locals().get("window_end", "n/a")),
+            "kept": 0,
+            "dropped_error": 0,
+            "dropped_no_latlong": 0,
+            "report_path": "n/a",
+            "output_table": output_table,
+            "failure_message": str(exc),
+        }
+        try:
+            notifier.send_notification(cfg, failure_summary)
+        except Exception:
+            logger.exception("Failure notification could not be sent.")
         raise
     finally:
         _cleanup_idle_postgres_sessions(conn)

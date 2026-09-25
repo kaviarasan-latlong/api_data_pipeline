@@ -99,5 +99,5 @@ output:
   report_filename_pattern: "api_data_pipeline_report.xlsx"
 
 notifier:
-  teams_webhook_url: ""
+  teams_webhook_url: "${TEAMS_WEBHOOK_URL}"
   template_path: "./notifier_template.json"
