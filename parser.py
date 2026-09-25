@@ -64,6 +64,24 @@ def _extract_point_latlng(value):
     return (float(match.group(1)), float(match.group(2)))
 
 
+def _extract_first_coordinate_pair(value):
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+
+    for fragment in re.split(r"[|;]", text):
+        cleaned = fragment.replace("+", " ").strip()
+        match = re.search(
+            r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*[,\s]\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)",
+            cleaned,
+        )
+        if match:
+            return (float(match.group(1)), float(match.group(2)))
+    return None
+
+
 def _find_latlong_in_obj(obj):
     """Recursively search a dict/list for a dict level holding both a
     lat-ish and lng-ish key (e.g. {"lat":.., "lng":..} or nested under
@@ -128,6 +146,14 @@ def _extract_from_path(path: str):
             lat = _as_float(v)
         elif LNG_KEY_RE.match(k):
             lng = _as_float(v)
+
+    if lat is None or lng is None:
+        for v in params.values():
+            pair = _extract_first_coordinate_pair(v)
+            if pair is not None:
+                lat, lng = pair
+                break
+
     latlong = (lat, lng) if lat is not None and lng is not None else None
     fields = _find_fields_in_obj(params)
     return latlong, fields
