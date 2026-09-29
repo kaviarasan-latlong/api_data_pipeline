@@ -136,6 +136,19 @@ def run():
             pipeline_name, window_start, window_end, is_resume, last_processed_id,
         )
 
+        total_request_rows = extractor.count_request_rows(conn, cfg, window_start, window_end)
+        completed_request_rows = extractor.count_request_rows(
+            conn, cfg, window_start, window_end, through_id=last_processed_id,
+        )
+        initial_progress_percent = (
+            100.0 if total_request_rows == 0
+            else min(100.0, completed_request_rows * 100.0 / total_request_rows)
+        )
+        logger.info(
+            "Total request-log rows in window: %d; progress starts at %d/%d (%.1f%%).",
+            total_request_rows, completed_request_rows, total_request_rows, initial_progress_percent,
+        )
+
         totals = {"kept": 0, "dropped_error": 0, "dropped_no_latlong": 0}
         all_error_ids = []
         all_no_latlong_ids = []
@@ -143,6 +156,7 @@ def run():
         for joined_rows, new_last_processed_id in extractor.iterate_chunks(
             conn, cfg, window_start, window_end, last_processed_id,
         ):
+            chunk_request_rows = sum("session_id" not in row for row in joined_rows)
             kept_rows, parse_counts, dropped_error_ids, dropped_no_latlong_ids = parser.parse_rows(joined_rows)
             for k in totals:
                 totals[k] += parse_counts.get(k, 0)
@@ -172,6 +186,15 @@ def run():
 
             watermark.update_last_processed_id(
                 conn, watermark_table, pipeline_name, window_start, new_last_processed_id,
+            )
+            completed_request_rows += chunk_request_rows
+            progress_percent = (
+                100.0 if total_request_rows == 0
+                else min(100.0, completed_request_rows * 100.0 / total_request_rows)
+            )
+            logger.info(
+                "Progress: %d/%d request-log rows completed (%.1f%%).",
+                completed_request_rows, total_request_rows, progress_percent,
             )
 
         if all_error_ids:

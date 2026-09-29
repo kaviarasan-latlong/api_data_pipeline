@@ -83,6 +83,28 @@ def _fetch_request_chunk(conn, cfg, window_start, window_end, last_processed_id)
     ]
 
 
+def count_request_rows(conn, cfg, window_start, window_end, through_id=None):
+    tables = cfg["tables"]
+    cols = cfg["pipeline"]["columns"]["request_logs"]
+    api_types = tuple(cfg["pipeline"]["included_api_types"])
+
+    id_filter = f"AND {cols['id']} <= %s" if through_id is not None else ""
+    params = [window_start, window_end, list(api_types)]
+    if through_id is not None:
+        params.append(through_id)
+    sql = f"""
+        SELECT COUNT(*)
+        FROM {tables['request_logs']}
+        WHERE {cols['created_at']} >= %s
+          AND {cols['created_at']} < %s
+          AND {cols['api_type']} = ANY(%s)
+          {id_filter}
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        return cur.fetchone()[0]
+
+
 def _fetch_response_batch(conn, cfg, requestids):
     if not requestids:
         return {}

@@ -1,89 +1,321 @@
-# latlong_pipeline
+# API Data Pipeline
 
-Rolling 3-day-window pipeline that pulls request/response API logs, extracts
-lat/long, geo-enriches missing state/district/pincode via PostGIS, writes
-the result to Postgres, and reports pincode/district/state hit counts to a
-workbook + Teams after every run.
+This project processes API request logs for a 3-day rolling window, extracts usable lat/long values, enriches them with admin-area metadata using PostGIS, writes the results to a final output table, and sends a Teams notification at the end of the run.
 
-## Files
+The pipeline is designed to work with server-side PostgreSQL tables such as `logs_aug_2026`, `response_logs_aug_2026`, `session_activities_aug_26`, `aa_geom`, and `admin_area`, and it is built to be resumable and safe to rerun.
 
-| File | Role |
-|---|---|
-| `config.yaml` | **Single place to configure everything** - DB, window size, chunk size, table/column names, and the `included_api_types` filter list. |
-| `config_loader.py` | Loads `config.yaml`, resolves `${ENV_VAR}` placeholders. |
-| `watermark.py` | Creates/reads/updates `pipeline_watermark` (window_start/window_end/last_processed_id/status). Handles resuming a crashed `RUNNING` window. |
-| `extractor.py` | Chunked pull from `request_logs` (filtered by window + `api_type`), batch-fetches matching `response_logs`, joins in memory by `uniqueid`. |
-| `parser.py` (Stage 1) | Extracts lat/long from the request path *and* response JSON generically (by key-name pattern, not per-api hardcoding). Applies the error/no-latlong drop rules below. |
-| `geo_enrichment.py` (Stage 2) | For rows missing state/district/pincode, does a batched `ST_Intersects` point-in-polygon lookup. |
-| `writer.py` (Stage 3) | Bulk-loads rows via `COPY` into a temp staging table, then upserts into the output table (safe to re-run a chunk). |
-| `metrics.py` | After a window succeeds: queries pincode/district/state counts and updates a cumulative `.xlsx` report (3 sheets). |
-| `notifier.py` | Renders `notifier_template.json` with the run summary and POSTs to the Teams webhook. |
-| `main.py` | Orchestrates all of the above. |
-| `run_pipeline.sh` | Activates the venv, runs `main.py`. Called by Airflow. |
-| `dags/api_dag.py` | Airflow DAG - schedules `run_pipeline.sh`. All real logic stays in `main.py` so a manual `python main.py` run behaves identically. |
+---
 
-## Adding / removing an API type
+## 1. Purpose
 
-Edit `config.yaml -> pipeline.included_api_types`. Nothing else needs to change -
-the extractor filters `request_logs.api_type = ANY(included_api_types)` directly
-from that list, and the parser doesn't care which api_type a row came from since
-it looks for lat/long generically by key name.
+The pipeline is meant to do the following:
 
-## Keep / drop rules (Stage 1) - as interpreted from the spec
+- read API request rows for a configured date window
+- filter only the required API types
+- fetch the corresponding response/session data
+- extract valid latitude and longitude values from request path / response JSON / session metadata
+- resolve pincode, district, and state from the spatial admin hierarchy
+- write the final enriched records into the output table
+- update the watermark so the job can resume safely
+- send a per-run summary to Teams
+- produce the cumulative reference workbook report
 
-The spec's flowchart and its inline note read as slightly contradictory
-("error -> drop" vs. "even if failure, take lat/long from the request path"),
-so here's the interpretation this code implements - flag it if it's not what
-you meant:
+---
 
-1. Always try to pull lat/long from the **request path** regardless of
-   response status (some APIs put lat/long in the request even when the
-   call fails).
-2. If the response is an error/failure, we do **not** trust the response
-   body for lat/long - only the request path can save the row.
-   - Found in request path -> **keep**.
-   - Not found anywhere -> **drop**, counted as `dropped_error`.
-3. If the response is **not** an error, the row is kept if lat/long is
-   found in request path and/or response.
-   - Not found anywhere -> **drop**, counted as `dropped_no_latlong`.
-   - Found in both -> **response wins on conflict**.
+## 2. Business logic summary
 
-## Report format note
+The pipeline follows the server-side requirements used by this project:
 
-The spec asked for "a csv with 3 sheets" (pincode / district / state counts,
-updated after every run). A CSV can't hold multiple sheets, so `metrics.py`
-writes a `.xlsx` workbook instead - same "3 tabs, running counts, updated
-every run" behavior, just in a format that can actually do it.
+- For most APIs, read the request rows from the request log table and pair them with the response log table.
+- For the 3 special brand-store APIs, read directly from `session_activities_aug_26` instead of the normal logs.
+- Extract the first valid coordinate pair from the query string when multiple values are present.
+- Prefer `origins` first for distance-matrix style URLs.
+- If a row contains a valid point, resolve it against the admin hierarchy using the geometry tables.
+- Only assign district/state when there is a valid pincode-bearing chain.
+- Do not invent fake state or district values when the spatial lookup does not produce a valid match.
+- Store the final output in the configured output table, with the final enriched values.
 
-## One-time setup
+---
 
-```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
+## 3. Project structure
 
-export DB_HOST=... DB_NAME=... DB_USER=... DB_PASSWORD=...
-export TEAMS_WEBHOOK_URL=...
+```text
+api_data_pipeline/
+├── api_dag.py
+├── config.yaml
+├── config_loader.py
+├── extractor.py
+├── geo_enrichment.py
+├── main.py
+├── metrics.py
+├── notifier.py
+├── notifier_template.json
+├── parser.py
+├── README.md
+├── requirements.txt
+├── run_pipeline.sh
+├── watermark.py
+├── writer.py
+└── ...
 ```
 
-Replace `notifier_template.json` with your real Teams template - just keep
-the `{{pipeline_name}}`, `{{window_start}}`, `{{window_end}}`, `{{kept}}`,
-`{{dropped_error}}`, `{{dropped_no_latlong}}`, `{{report_path}}` tokens (or
-add more keys in `metrics.build_run_summary` if your template needs more).
+### Core files
 
-Deploy the pipeline directory to wherever `dags/api_dag.py`'s `PIPELINE_DIR`
-points, and set the `latlong_db_host` / `latlong_db_name` / `latlong_db_user`
-/ `latlong_db_password` / `latlong_teams_webhook_url` Airflow Variables.
+- `main.py`: orchestration layer
+- `extractor.py`: fetches rows by window and API type
+- `parser.py`: extracts lat/long and applies drop rules
+- `geo_enrichment.py`: resolves pincode, district, and state using geometry and admin tables
+- `writer.py`: writes final rows to the output table
+- `watermark.py`: manages resume state for windows
+- `config.yaml`: all environment-specific settings
+- `metrics.py`: builds the report workbook and summary
+- `notifier.py`: posts pipeline status to Teams
 
-## Manual run / backfill
+---
 
-```bash
-cd latlong_pipeline
-python main.py
+## 4. Configuration
+
+All project-specific runtime settings are in `config.yaml`.
+
+Key sections include:
+
+- `database`: PostgreSQL connection details
+- `pipeline`: API list, window settings, chunk size, worker count, start date
+- `tables`: source and output table names
+- `geo_enrichment`: geometry and admin column mappings
+- `output`: report directory and workbook naming
+- `notifier`: Teams webhook configuration
+
+### Example config shape
+
+```yaml
+database:
+  host: "localhost"
+  port: 5432
+  dbname: "admin_area"
+  user: "www-data"
+  password: "******"
+
+pipeline:
+  name: "api_data_pipeline"
+  window_days: 3
+  start_date: "2026-08-01T00:00:00+05:30"
+  chunk_size: 75000
+  parallel_workers: 4
+
+  included_api_types:
+   - /v4/isochrone.json
+    - /v4/geofence/contains.json
+    - /v4/geocode.json
+    - /v4/snap.json
+    - /v4/distancematrix.json
+    - /v4/pincode.json
+    - /v4/reverse_geocode.json
+    - /v4/landmarks.json
+    - /v4/directions.json
+    - /v4/distance.json
+    - /v4/geovalidation.json
+    - /v4/search.json
+    - /v4/trips.json
+    - /v4/reverse_geocode_international.json
+    - /v4/geo_cipher.json
+    - /v4/draw_line.json
+    - /v5/search.json
+    - /v5/digipin_encode.json
+    - /v5/digipin_decode.json
+    - /v4/point_of_interest.json
+
+  session_only_api_types:
+    - /v4.1/brands/:brand_id/stores_around.json
+    - /v4.1/brands/:brand_id/find.json
+    - /v4.1/brands/:brand_id/search_with_disable.json
+
+tables:
+  request_logs: "logs_aug_2026"
+  response_logs: "response_logs_aug_2026"
+  session_activities: "session_activities_aug_26"
+  watermark_table: "pipeline_watermark"
+  output_table: "admin_area_enriched_final"
+  geom_table: "aa_geom"
+  area_table: "admin_area"
 ```
 
-Safe to re-run: `watermark.py` resumes a `RUNNING` window from its
-`last_processed_id`, and `writer.py`'s upsert means reprocessing a chunk
-doesn't double-count rows in the output table (the xlsx report, being
-purely additive, is the one place a re-run of a *successful* window would
-double-count - it's designed to be updated once per window on success).
+---
+
+## 5. Data flow
+
+### Stage 1: Extract
+
+`extractor.py` pulls rows in chunks based on:
+
+- window start and end
+- API type filter
+- last processed row ID from watermark state
+
+It fetches:
+
+- request rows from the request log table
+- matching response rows from the response log table
+- direct session rows for the special 3 APIs
+
+### Stage 2: Parse
+
+`parser.py` performs this logic:
+
+- extract lat/long from request path, response JSON, and session payloads
+- prefer the first valid coordinate pair in the expected precedence order
+- classify rows into kept / dropped_error / dropped_no_latlong
+- keep rows that have a usable lat/long point
+
+### Stage 3: Geo enrichment
+
+`geo_enrichment.py` resolves the point against `aa_geom` and walks the admin hierarchy in `admin_area`.
+
+It uses the rules:
+
+- valid pincode-bearing chain required
+- district/state only assigned when supported by the geometry lookup
+- using the aa_in_aa_id column
+
+### Stage 4: Write
+
+`writer.py` writes the final rows into the configured output table using staged bulk inserts for safe reprocessing.
+
+### Stage 5: Watermark and reporting
+
+`watermark.py` stores the processing state so the script can resume from the last successful row ID. `metrics.py` updates the cumulative workbook report and `notifier.py` sends status to Teams.
+
+---
+
+## 6. Watermark behavior
+
+The pipeline keeps a watermark table named in config, usually `pipeline_watermark`.
+
+This table stores the current run state, including:
+
+- pipeline name
+- window start date
+- window end date
+- last processed row ID
+- status
+
+This allows the pipeline to resume if a run is interrupted and prevents reprocessing the entire window from the beginning.
+
+---
+
+## 7. Run flow
+
+### Manual execution
+
+```bash
+cd /home/kaviarasan/work/api_data_pipeline
+python3 main.py
+```
+
+### Shell wrapper
+
+```bash
+bash run_pipeline.sh
+```
+
+---
+
+## 8. Airflow usage
+
+This project includes `api_dag.py` for Airflow scheduling.
+
+The DAG invokes the project shell wrapper so the real logic remains in Python and Airflow is just the scheduler/trigger layer.
+
+The expected pattern is:
+
+- DAG file lives in Airflow DAG directory
+- pipeline project lives in a separate folder accessible by Airflow
+- Airflow triggers the shell wrapper or Python entry point
+
+---
+
+## 9. Teams notifications
+
+The pipeline sends Teams notifications using the configured webhook.
+
+The notifier sends a compact adaptive card with:
+
+- pipeline name
+- window range
+- output table name
+- success or failure status
+- report path (successful runs)
+- failure description (failure paths)
+
+The webhook URL must be valid and reachable from the server where the process is running.
+
+---
+
+## 10. Operational notes
+
+### Safe reruns
+
+The project is designed for safe reruns:
+
+- watermark resumes from the previous row ID
+- staging writes avoid duplicate insertion in the output table
+- failed runs mark the window as failed
+
+### Performance tuning
+
+The project includes a bounded parallel enrichment mode, but the main write path remains serialized to protect database consistency.
+
+Recommended starting point:
+
+- `parallel_workers: 4`
+- `chunk_size: 75000` or lower if DB load is heavy
+
+### Common issues
+
+- missing or invalid webhook URL
+- incorrect table/column names in database
+- missing geometry/admin data for a point
+- empty or malformed lat/long extracted from request path
+- idle DB sessions after a forced stop
+
+---
+
+## 11. Output table
+
+The final result is written to the configured output table, which is typically:
+
+```text
+admin_area_enriched_final
+```
+
+This table stores results such as:
+
+- `bunit_id`
+- `tenant_id`
+- `api_type`
+- `api_version`
+- `latitude`
+- `longitude`
+- `state`
+- `district`
+- `pincode`
+- `address`
+
+---
+
+## 12. Quick start checklist
+
+1. Validate PostgreSQL connection settings in `config.yaml`
+2. Confirm table names and column mappings
+3. Confirm the API allowlist contains the required endpoints
+4. Confirm the Teams webhook URL is valid
+5. Run the script manually once
+6. Validate inserted rows in the output table
+7. Move the DAG to the Airflow DAG folder
+8. Trigger the DAG from Airflow or schedule it
+
+---
+
+## 13. Summary
+
+This pipeline is a resumable, chunk-based PostgreSQL ETL job that transforms API lat/long records into a clean admin-area-enriched dataset for reporting and downstream use. It is built to be practical for real server environments: robust to reruns, safe with DB writes, easy to configure, and integrated with Teams notifications for operational visibility.
