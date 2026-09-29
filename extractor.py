@@ -205,3 +205,4 @@ def iterate_chunks(conn, cfg, window_start, window_end, start_last_processed_id)
             len(session_rows),
         )
         yield joined, new_last_processed_id
+        last_processed_id = new_last_processed_id
