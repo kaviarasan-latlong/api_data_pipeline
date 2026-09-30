@@ -119,6 +119,11 @@ def _find_latlong_in_obj(obj):
                 return found
     elif isinstance(obj, list):
         for item in obj:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                lat = _as_float(item[0])
+                lng = _as_float(item[1])
+                if lat is not None and lng is not None:
+                    return (lat, lng)
             found = _find_latlong_in_obj(item)
             if found:
                 return found
