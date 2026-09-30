@@ -17,8 +17,8 @@ pipeline:
   name: "api_data_pipeline"
   window_days: 3
   start_date: "2026-08-01T00:00:00+05:30"
-  chunk_size: 75000
-  parallel_workers: 4
+  chunk_size: 500000
+  parallel_workers: 10
 
   included_api_types:
     - /v4/isochrone.json
@@ -92,7 +92,7 @@ geo_enrichment:
     a_id: "id"
     parent_id: "aa_in_aa_id"
     display_name: "display_name"
-  batch_size: 5000
+  batch_size: 25000
 
 output:
   report_dir: "/var/www/kaviarasan/api_data_pipeline"

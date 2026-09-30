@@ -167,42 +167,68 @@ def iterate_chunks(conn, cfg, window_start, window_end, start_last_processed_id)
     """
     Generator yielding (joined_rows, new_last_processed_id) per chunk.
     Stops when a chunk comes back empty (window exhausted).
+
+    Session-activity rows (for the 3 brand-store APIs) are fetched ONCE
+    before the loop and included only in the first yielded chunk, so they
+    are never duplicated across chunks.
     """
     last_processed_id = start_last_processed_id
+
+    # --- Fetch session rows exactly once for the whole window ---
+    session_rows = _fetch_session_activity_chunk(conn, cfg, window_start, window_end)
+    if session_rows:
+        logger.info("Fetched %d session-activity rows for window (one-time).", len(session_rows))
+    session_emitted = False
 
     while True:
         request_rows = _fetch_request_chunk(conn, cfg, window_start, window_end, last_processed_id)
         if not request_rows:
+            # If we still have un-emitted session rows and no request rows
+            # at all, yield them as a standalone chunk.
+            if session_rows and not session_emitted:
+                session_emitted = True
+                session_joined = [
+                    {**sr, "requestid": None, "response_data": None, "response_status": None}
+                    for sr in session_rows
+                ]
+                logger.info(
+                    "No request rows remain; yielding %d session-only rows.",
+                    len(session_joined),
+                )
+                yield session_joined, last_processed_id
             logger.info("No more rows in window after id=%s - window exhausted.", last_processed_id)
             return
 
         requestids = [r["requestid"] for r in request_rows]
         response_by_id = _fetch_response_batch(conn, cfg, requestids)
-        session_rows = _fetch_session_activity_chunk(conn, cfg, window_start, window_end)
 
         joined = []
         for req in request_rows:
             resp = response_by_id.get(req["requestid"], {})
             joined.append({**req, **resp})
 
-        for session_row in session_rows:
-            joined.append({
-                **session_row,
-                "requestid": None,
-                "response_data": None,
-                "response_status": None,
-            })
+        # Append session rows only on the first chunk
+        session_count_this_chunk = 0
+        if session_rows and not session_emitted:
+            session_emitted = True
+            for session_row in session_rows:
+                joined.append({
+                    **session_row,
+                    "requestid": None,
+                    "response_data": None,
+                    "response_status": None,
+                })
+            session_count_this_chunk = len(session_rows)
 
-        new_last_processed_id = max(
-            [request_rows[-1]["id"], max((sr["id"] for sr in session_rows), default=0)]
-        )
+        # last_processed_id tracks only request-log rows (stable resume key)
+        new_last_processed_id = request_rows[-1]["id"]
         logger.info(
-            "Fetched normal chunk of %d rows (ids %s..%s), %d matched responses, %d session-only rows added.",
+            "Fetched chunk of %d request rows (ids %s..%s), %d matched responses, %d session rows included.",
             len(request_rows),
             request_rows[0]["id"],
             new_last_processed_id,
             len(response_by_id),
-            len(session_rows),
+            session_count_this_chunk,
         )
         yield joined, new_last_processed_id
         last_processed_id = new_last_processed_id
