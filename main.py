@@ -48,7 +48,7 @@ def _write_error_ids_file(path: str, ids: list, mode: str = "w"):
 
 
 def _cleanup_idle_postgres_sessions(conn):
-    if conn is None:
+    if conn is None or conn.closed:
         return
     try:
         try:
