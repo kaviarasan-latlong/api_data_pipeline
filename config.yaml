@@ -9,8 +9,8 @@ database:
   host: "localhost"
   port: 5432
   dbname: "admin_area"
-  user: "www-data"
-  password: "krishna_g1r1"
+  user: ""
+  password: ""
   connect_timeout: 10
 
 pipeline:
