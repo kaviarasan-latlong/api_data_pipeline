@@ -14,29 +14,30 @@ windows back-to-back with no overlap).
 from datetime import datetime, timedelta
 
 from airflow import DAG
-from airflow.operators.python import PythonOperator
+from airflow.operators.bash import BashOperator
 
-from main import run
+PIPELINE_DIR = "/var/www/kaviarasan/api_data_pipeline"
 
 default_args = {
-    "owner": "data-engineering",
+    "owner": "airflow",
     "retries": 2,
     "retry_delay": timedelta(minutes=10),
 }
 
-with DAG(
-    dag_id="admin_area_enrichment_pipeline",
+dag = DAG(
+    "api_data_pipeline",
     default_args=default_args,
     description="Extracts lat/long from API logs and geo-enriches them into admin-area hierarchy data",
-    schedule="30 18 * * *",
-    start_date=datetime(2026, 1, 1),
+    schedule="13 15 * * *",
+    start_date=datetime(2026, 10, 1),
     catchup=False,
     max_active_runs=1,
     tags=["admin_area", "geo", "etl"],
-) as dag:
+)
 
-    run_pipeline = PythonOperator(
-        task_id="run_pipeline",
-        python_callable=run,
-        provide_context=True,
-    )
+run_pipeline = BashOperator(
+    task_id="run_pipeline",
+    bash_command=f"bash {PIPELINE_DIR}/run_pipeline.sh;",
+    cwd=PIPELINE_DIR,
+    dag=dag,
+)

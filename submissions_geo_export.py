@@ -1,0 +1,360 @@
+#!/usr/bin/env python3
+"""Standalone export of submission coordinates and their admin areas.
+
+Run with PGHOST, PGPORT, PGDATABASE, PGUSER, PGPASSWORD, and
+TEAMS_WEBHOOK_URL set, then provide an ISO-8601 start and end window.
+The end timestamp is exclusive. This file is intentionally not wired into
+the API data pipeline.
+"""
+
+import argparse
+import logging
+import os
+import re
+import sys
+from datetime import datetime
+
+import psycopg2
+import requests
+from psycopg2.extras import execute_values
+
+
+LOGGER = logging.getLogger("submissions_geo_export")
+OUTPUT_TABLE = "anuga_final"
+COORDINATE_PATTERN = r"(-?\d{1,2}\.\d+),\s*(-?\d{1,3}\.\d+)"
+INSERT_BATCH_SIZE = 5000
+
+
+def _parse_timestamp(value):
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"Invalid ISO-8601 timestamp: {value}"
+        ) from exc
+
+
+def _database_connection():
+    required = ("PGDATABASE", "PGUSER", "PGPASSWORD")
+    missing = [name for name in required if not os.environ.get(name)]
+    if missing:
+        raise RuntimeError("Missing database environment variables: " + ", ".join(missing))
+
+    return psycopg2.connect(
+        host=os.environ.get("PGHOST", "localhost"),
+        port=os.environ.get("PGPORT", "5432"),
+        dbname=os.environ["PGDATABASE"],
+        user=os.environ["PGUSER"],
+        password=os.environ["PGPASSWORD"],
+        connect_timeout=int(os.environ.get("PGCONNECT_TIMEOUT", "10")),
+    )
+
+
+def _table_columns(conn, table_name):
+    with conn.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = %s
+            """,
+            (table_name,),
+        )
+        return {row[0] for row in cursor.fetchall()}
+
+
+def _ensure_output_table(conn):
+    with conn.cursor() as cursor:
+        cursor.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {OUTPUT_TABLE} (
+                name text,
+                bunit_id text,
+                latitude double precision,
+                longitude double precision,
+                state text,
+                district text,
+                pincode text
+            )
+            """
+        )
+        cursor.execute(
+            f"""
+            CREATE UNIQUE INDEX IF NOT EXISTS {OUTPUT_TABLE}_row_uidx
+            ON {OUTPUT_TABLE}
+                (name, bunit_id, latitude, longitude, state, district, pincode)
+            """
+        )
+
+
+def _resolve_hierarchy(chain_rows):
+    pincode = None
+    district = None
+    state = None
+
+    for row in chain_rows:
+        display_name = str(row[0]).strip() if row[0] else ""
+        area_order = row[1]
+        pin_match = re.match(r"^\s*(\d{6})", display_name)
+
+        if pincode is None and (area_order == 55 or pin_match):
+            if pin_match:
+                pincode = pin_match.group(1)
+            if pincode is None:
+                continue
+            continue
+        if pincode is None:
+            continue
+        if area_order == 8 and district is None:
+            district = re.sub(r"^\d{6}\s*[-\u2013]?\s*", "", display_name).strip()
+            continue
+        if area_order == 9 and state is None:
+            state = re.sub(r"^\d{6}\s*[-\u2013]?\s*", "", display_name).strip()
+            break
+
+        if district is None and area_order is None:
+            district = re.sub(r"^\d{6}\s*[-\u2013]?\s*", "", display_name).strip()
+            continue
+        if district and state is None and area_order is None:
+            state = re.sub(r"^\d{6}\s*[-\u2013]?\s*", "", display_name).strip()
+            break
+
+    return state or None, district or None, pincode
+
+
+def _submission_query(geom_columns, area_columns):
+    geom_filters = []
+    if "to_date" in geom_columns:
+        geom_filters.append("g.to_date IS NULL")
+    if "aa_order" in geom_columns:
+        geom_filters.append("g.aa_order = 55")
+    geom_filter_sql = " AND ".join(geom_filters) if geom_filters else "TRUE"
+
+    area_order_select = "a.aa_order" if "aa_order" in area_columns else "NULL::integer"
+    area_to_date_filter = "AND a.to_date IS NULL" if "to_date" in area_columns else ""
+
+    return f"""
+        WITH extracted AS (
+            SELECT
+                row_number() OVER () AS row_id,
+                sv.name,
+                sv.bunit_id,
+                coordinate_match.parts[1]::double precision AS latitude,
+                coordinate_match.parts[2]::double precision AS longitude
+            FROM submissions s
+            JOIN survey sv ON sv.id = s.survey_id
+            CROSS JOIN LATERAL (
+                SELECT regexp_match(s.content::text, %s) AS parts
+            ) coordinate_match
+            WHERE s.created_at >= %s
+              AND s.created_at < %s
+              AND coordinate_match.parts IS NOT NULL
+        ),
+        valid_points AS (
+            SELECT * FROM extracted
+            WHERE latitude BETWEEN -90 AND 90
+              AND longitude BETWEEN -180 AND 180
+        ),
+        matched AS (
+            SELECT p.*, geo.aa_id
+            FROM valid_points p
+            LEFT JOIN LATERAL (
+                SELECT g.aa_id
+                FROM aa_geom g
+                WHERE ST_Intersects(
+                    g.geom,
+                    ST_SetSRID(ST_MakePoint(p.longitude, p.latitude), 4326)
+                )
+                  AND {geom_filter_sql}
+                LIMIT 1
+            ) geo ON TRUE
+        ),
+        chain AS (
+            SELECT
+                m.row_id, m.name, m.bunit_id, m.latitude, m.longitude,
+                a.id AS current_id,
+                a.display_name,
+                a.aa_in_aa_id AS parent_id,
+                {area_order_select} AS aa_order,
+                1 AS depth
+            FROM matched m
+            LEFT JOIN admin_area a ON a.id = m.aa_id
+            {area_to_date_filter}
+
+            UNION ALL
+
+            SELECT
+                c.row_id, c.name, c.bunit_id, c.latitude, c.longitude,
+                a.id AS current_id,
+                a.display_name,
+                a.aa_in_aa_id AS parent_id,
+                {area_order_select} AS aa_order,
+                c.depth + 1 AS depth
+            FROM chain c
+            JOIN admin_area a ON a.id = c.parent_id
+            WHERE c.depth < 10
+              AND c.parent_id IS NOT NULL
+              {area_to_date_filter}
+        )
+        SELECT row_id, name, bunit_id, latitude, longitude,
+               display_name, aa_order, depth
+        FROM chain
+        ORDER BY row_id, depth
+    """
+
+
+def _write_batch(conn, rows):
+    if not rows:
+        return
+    with conn.cursor() as cursor:
+        execute_values(
+            cursor,
+            f"""
+            INSERT INTO {OUTPUT_TABLE}
+                (name, bunit_id, latitude, longitude, state, district, pincode)
+            VALUES %s
+            ON CONFLICT DO NOTHING
+            """,
+            rows,
+            page_size=INSERT_BATCH_SIZE,
+        )
+
+
+def _process_window(conn, start, end):
+    geom_columns = _table_columns(conn, "aa_geom")
+    area_columns = _table_columns(conn, "admin_area")
+    if not {"aa_id", "geom"}.issubset(geom_columns):
+        raise RuntimeError("aa_geom must contain aa_id and geom columns")
+    if not {"id", "aa_in_aa_id", "display_name"}.issubset(area_columns):
+        raise RuntimeError(
+            "admin_area must contain id, aa_in_aa_id, and display_name columns"
+        )
+
+    query = _submission_query(geom_columns, area_columns)
+    cursor = conn.cursor(name="submissions_geo_export_cursor")
+    cursor.itersize = INSERT_BATCH_SIZE
+    cursor.execute(query, (COORDINATE_PATTERN, start, end))
+
+    inserted_rows = 0
+    pending = []
+    current_id = None
+    current_fields = None
+    hierarchy_rows = []
+
+    def flush_current():
+        nonlocal inserted_rows
+        if current_fields is None:
+            return
+        state, district, pincode = _resolve_hierarchy(hierarchy_rows)
+        pending.append((*current_fields, state, district, pincode))
+        if len(pending) >= INSERT_BATCH_SIZE:
+            _write_batch(conn, pending)
+            inserted_rows += len(pending)
+            pending.clear()
+
+    try:
+        while True:
+            batch = cursor.fetchmany(INSERT_BATCH_SIZE)
+            if not batch:
+                break
+            for row in batch:
+                row_id, name, bunit_id, latitude, longitude, display_name, aa_order, _depth = row
+                if row_id != current_id:
+                    flush_current()
+                    current_id = row_id
+                    current_fields = (name, str(bunit_id) if bunit_id is not None else None,
+                                      latitude, longitude)
+                    hierarchy_rows = []
+                if display_name is not None:
+                    hierarchy_rows.append((display_name, aa_order))
+        flush_current()
+        if pending:
+            _write_batch(conn, pending)
+            inserted_rows += len(pending)
+    finally:
+        cursor.close()
+
+    return inserted_rows
+
+
+def _send_teams_notification(webhook_url, title, details, failed=False):
+    payload = {
+        "type": "message",
+        "attachments": [
+            {
+                "contentType": "application/vnd.microsoft.card.adaptive",
+                "content": {
+                    "type": "AdaptiveCard",
+                    "version": "1.4",
+                    "body": [
+                        {
+                            "type": "Container",
+                            "style": "Attention" if failed else "Good",
+                            "items": [
+                                {"type": "TextBlock", "text": title,
+                                 "weight": "Bolder", "size": "Medium", "wrap": True},
+                                {"type": "TextBlock", "text": details, "wrap": True},
+                            ],
+                        }
+                    ],
+                    "msteams": {"width": "Full"},
+                },
+            }
+        ],
+    }
+    response = requests.post(webhook_url, json=payload, timeout=15)
+    response.raise_for_status()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--start", required=True, type=_parse_timestamp,
+                        help="Inclusive created_at window start (ISO-8601)")
+    parser.add_argument("--end", required=True, type=_parse_timestamp,
+                        help="Exclusive created_at window end (ISO-8601)")
+    args = parser.parse_args()
+
+    if args.start >= args.end:
+        parser.error("--start must be earlier than --end")
+
+    webhook_url = os.environ.get("TEAMS_WEBHOOK_URL")
+    if not webhook_url:
+        parser.error("TEAMS_WEBHOOK_URL must be set")
+
+    conn = None
+    try:
+        conn = _database_connection()
+        _ensure_output_table(conn)
+        row_count = _process_window(conn, args.start, args.end)
+        conn.commit()
+        details = (
+            f"Table: {OUTPUT_TABLE} | Window: {args.start.isoformat()} to "
+            f"{args.end.isoformat()} (end exclusive) | Rows processed: {row_count}"
+        )
+        _send_teams_notification(webhook_url, "Submissions geo export completed", details)
+        LOGGER.info("Export completed; %d rows written or already present.", row_count)
+        return 0
+    except Exception as exc:
+        if conn is not None:
+            conn.rollback()
+        LOGGER.exception("Submissions geo export failed")
+        details = (
+            f"Table: {OUTPUT_TABLE} | Window: {args.start.isoformat()} to "
+            f"{args.end.isoformat()} (end exclusive) | Error: {exc}"
+        )
+        try:
+            _send_teams_notification(webhook_url, "Submissions geo export failed", details, failed=True)
+        except Exception:
+            LOGGER.exception("Could not send the Teams failure notification")
+        return 1
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+    sys.exit(main())

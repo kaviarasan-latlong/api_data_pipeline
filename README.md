@@ -303,7 +303,51 @@ This table stores results such as:
 
 ---
 
-## 12. Quick start checklist
+## 12. Standalone submissions export
+
+`submissions_geo_export.py` is a separate command-line job. It is not called by
+`main.py`, `run_pipeline.sh`, or the Airflow DAG. Run it manually when the
+submissions export is needed, for example after the API pipeline has completed.
+
+The job reads `submissions.content`, joins `submissions.survey_id` to
+`survey.id`, and gets the name and `bunit_id` from `survey`. It extracts the
+first decimal latitude/longitude pair from the content, filters submissions by
+`created_at`, and uses `aa_geom` and `admin_area` to look up state, district,
+and pincode. Rows without a valid coordinate pair are skipped.
+
+The job creates and writes to `anuga_final` with these columns:
+
+- `name`
+- `bunit_id`
+- `latitude`
+- `longitude`
+- `state`
+- `district`
+- `pincode`
+
+Set the following environment variables before running it:
+
+- `PGDATABASE`, `PGUSER`, and `PGPASSWORD` (required)
+- `PGHOST` and `PGPORT` (optional; default to `localhost` and `5432`)
+- `PGCONNECT_TIMEOUT` (optional; defaults to `10` seconds)
+- `TEAMS_WEBHOOK_URL` (required; uses the Teams webhook endpoint)
+
+Provide the start and end of the `created_at` window as ISO-8601 timestamps.
+The start is inclusive and the end is exclusive:
+
+```bash
+python3 submissions_geo_export.py \
+  --start 2026-10-01T00:00:00+05:30 \
+  --end 2026-10-02T00:00:00+05:30
+```
+
+The job sends a distinct Teams notification for success or failure. Database
+errors roll back the current run and return a non-zero exit status. This export
+does not change the API pipeline's configuration, tables, or notifications.
+
+---
+
+## 13. Quick start checklist
 
 1. Validate PostgreSQL connection settings in `config.yaml`
 2. Confirm table names and column mappings
@@ -316,6 +360,6 @@ This table stores results such as:
 
 ---
 
-## 13. Summary
+## 14. Summary
 
 This pipeline is a resumable, chunk-based PostgreSQL ETL job that transforms API lat/long records into a clean admin-area-enriched dataset for reporting and downstream use. It is built to be practical for real server environments: robust to reruns, safe with DB writes, easy to configure, and integrated with Teams notifications for operational visibility.

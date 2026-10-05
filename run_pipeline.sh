@@ -5,8 +5,8 @@
 
 set -euo pipefail
 
-PIPELINE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VENV_PATH="${PIPELINE_VENV_PATH:-$PIPELINE_DIR/venv}"
+PIPELINE_DIR="/var/www/kaviarasan/api_data_pipeline"
+VENV_PATH="/var/www/kaviarasan/api_data_pipeline/venv"
 
 if [ -f "$VENV_PATH/bin/activate" ]; then
     source "$VENV_PATH/bin/activate"
@@ -15,4 +15,4 @@ else
 fi
 
 cd "$PIPELINE_DIR"
-python main.py
+TEAMS_WEBHOOK_URL="REPLACE_WITH_YOUR_WEBHOOK_URL" python main.py
