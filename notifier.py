@@ -30,7 +30,7 @@ def _render_template(template_str: str, values: dict) -> str:
 
 
 def _build_adaptive_card(run_summary: dict, message: str, style: str = "Attention"):
-    pipeline_name = run_summary.get("pipeline_name", "api_data_pipeline")
+    pipeline_name = run_summary.get("pipeline_name", "data_pipeline")
     window_start = run_summary.get("window_start", "n/a")
     window_end = run_summary.get("window_end", "n/a")
     output_table = run_summary.get("output_table", "n/a")
@@ -81,7 +81,7 @@ def _build_adaptive_card(run_summary: dict, message: str, style: str = "Attentio
 def send_notification(cfg, run_summary: dict):
     webhook_url = cfg["notifier"]["teams_webhook_url"]
     message = (
-        f"Pipeline: {run_summary.get('pipeline_name', 'api_data_pipeline')} | "
+        f"Pipeline: {run_summary.get('pipeline_name', 'data_pipeline')} | "
         f"Window: {run_summary.get('window_start', 'n/a')} -> {run_summary.get('window_end', 'n/a')} | "
         f"Output table: {run_summary.get('output_table', 'n/a')}"
     )

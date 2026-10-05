@@ -40,7 +40,7 @@ The pipeline follows the server-side requirements used by this project:
 ## 3. Project structure
 
 ```text
-api_data_pipeline/
+data_pipeline/
 ├── api_dag.py
 ├── config.yaml
 ├── config_loader.py
@@ -97,7 +97,7 @@ database:
   password: "******"
 
 pipeline:
-  name: "api_data_pipeline"
+  name: "data_pipeline"
   window_days: 3
   start_date: "2026-08-01T00:00:00+05:30"
   chunk_size: 75000
@@ -208,7 +208,7 @@ This allows the pipeline to resume if a run is interrupted and prevents reproces
 ### Manual execution
 
 ```bash
-cd /home/kaviarasan/work/api_data_pipeline
+cd "$(git rev-parse --show-toplevel)"
 python3 main.py
 ```
 
@@ -309,11 +309,16 @@ This table stores results such as:
 `main.py`, `run_pipeline.sh`, or the Airflow DAG. Run it manually when the
 submissions export is needed, for example after the API pipeline has completed.
 
-The job reads `submissions.content`, joins `submissions.survey_id` to
-`survey.id`, and gets the name and `bunit_id` from `survey`. It extracts the
+The source tables are `submissions` and `surveys`. The job reads
+`submissions.content`, joins `submissions.survey_id` to `surveys.id`, and gets
+the name and `bunit_id` from `surveys`. It extracts the
 first decimal latitude/longitude pair from the content, filters submissions by
 `created_at`, and uses `aa_geom` and `admin_area` to look up state, district,
 and pincode. Rows without a valid coordinate pair are skipped.
+
+The source table names are configured under `tables` in `config.yaml`; their
+required fields are mapped under `pipeline.columns.submissions` and
+`pipeline.columns.surveys`.
 
 The job creates and writes to `anuga_final` with these columns:
 
@@ -330,7 +335,10 @@ Set the following environment variables before running it:
 - `PGDATABASE`, `PGUSER`, and `PGPASSWORD` (required)
 - `PGHOST` and `PGPORT` (optional; default to `localhost` and `5432`)
 - `PGCONNECT_TIMEOUT` (optional; defaults to `10` seconds)
-- `TEAMS_WEBHOOK_URL` (required; uses the Teams webhook endpoint)
+
+Set `notifier.teams_webhook_url` in `config.yaml` to the Teams webhook URL.
+Both this standalone export and the API pipeline read the webhook from that
+setting; `run_pipeline.sh` does not override it.
 
 Provide the start and end of the `created_at` window as ISO-8601 timestamps.
 The start is inclusive and the end is exclusive:

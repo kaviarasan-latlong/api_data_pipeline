@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Standalone export of submission coordinates and their admin areas.
 
-Run with PGHOST, PGPORT, PGDATABASE, PGUSER, PGPASSWORD, and
-TEAMS_WEBHOOK_URL set, then provide an ISO-8601 start and end window.
+Run with PGHOST, PGPORT, PGDATABASE, and PGPASSWORD set, then provide an
+ISO-8601 start and end window. The Teams webhook is read from config.yaml.
 The end timestamp is exclusive. This file is intentionally not wired into
 the API data pipeline.
 """
@@ -13,9 +13,11 @@ import os
 import re
 import sys
 from datetime import datetime
+from pathlib import Path
 
 import psycopg2
 import requests
+import yaml
 from psycopg2.extras import execute_values
 
 
@@ -23,6 +25,7 @@ LOGGER = logging.getLogger("submissions_geo_export")
 OUTPUT_TABLE = "anuga_final"
 COORDINATE_PATTERN = r"(-?\d{1,2}\.\d+),\s*(-?\d{1,3}\.\d+)"
 INSERT_BATCH_SIZE = 5000
+IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def _parse_timestamp(value):
@@ -48,6 +51,32 @@ def _database_connection():
         password=os.environ["PGPASSWORD"],
         connect_timeout=int(os.environ.get("PGCONNECT_TIMEOUT", "10")),
     )
+
+
+def _load_source_config():
+    config_path = Path(__file__).with_name("config.yaml")
+    with config_path.open(encoding="utf-8") as config_file:
+        config = yaml.safe_load(config_file)
+
+    tables = config["tables"]
+    columns = config["pipeline"]["columns"]
+    source_config = {
+        "submissions_table": tables["submissions"],
+        "survey_table": tables["surveys"],
+        "submission_columns": columns["submissions"],
+        "survey_columns": columns["surveys"],
+        "teams_webhook_url": config["notifier"]["teams_webhook_url"],
+    }
+    identifiers = [source_config["submissions_table"], source_config["survey_table"]]
+    identifiers.extend(source_config["submission_columns"].values())
+    identifiers.extend(source_config["survey_columns"].values())
+    invalid = [
+        value for value in identifiers
+        if not isinstance(value, str) or not IDENTIFIER_PATTERN.fullmatch(value)
+    ]
+    if invalid:
+        raise ValueError(f"Invalid SQL identifiers in config.yaml: {invalid}")
+    return source_config
 
 
 def _table_columns(conn, table_name):
@@ -122,7 +151,7 @@ def _resolve_hierarchy(chain_rows):
     return state or None, district or None, pincode
 
 
-def _submission_query(geom_columns, area_columns):
+def _submission_query(geom_columns, area_columns, source_config):
     geom_filters = []
     if "to_date" in geom_columns:
         geom_filters.append("g.to_date IS NULL")
@@ -132,22 +161,31 @@ def _submission_query(geom_columns, area_columns):
 
     area_order_select = "a.aa_order" if "aa_order" in area_columns else "NULL::integer"
     area_to_date_filter = "AND a.to_date IS NULL" if "to_date" in area_columns else ""
+    submissions_table = f'"{source_config["submissions_table"]}"'
+    survey_table = f'"{source_config["survey_table"]}"'
+    submission_columns = {
+        key: f'"{value}"' for key, value in source_config["submission_columns"].items()
+    }
+    survey_columns = {
+        key: f'"{value}"' for key, value in source_config["survey_columns"].items()
+    }
 
     return f"""
         WITH extracted AS (
             SELECT
                 row_number() OVER () AS row_id,
-                sv.name,
-                sv.bunit_id,
+                sv.{survey_columns['name']} AS name,
+                sv.{survey_columns['bunit_id']} AS bunit_id,
                 coordinate_match.parts[1]::double precision AS latitude,
                 coordinate_match.parts[2]::double precision AS longitude
-            FROM submissions s
-            JOIN survey sv ON sv.id = s.survey_id
+                        FROM {submissions_table} s
+                        JOIN {survey_table} sv
+                            ON sv.{survey_columns['id']} = s.{submission_columns['survey_id']}
             CROSS JOIN LATERAL (
-                SELECT regexp_match(s.content::text, %s) AS parts
+                                SELECT regexp_match(s.{submission_columns['content']}::text, %s) AS parts
             ) coordinate_match
-            WHERE s.created_at >= %s
-              AND s.created_at < %s
+                        WHERE s.{submission_columns['created_at']} >= %s
+                            AND s.{submission_columns['created_at']} < %s
               AND coordinate_match.parts IS NOT NULL
         ),
         valid_points AS (
@@ -220,7 +258,7 @@ def _write_batch(conn, rows):
         )
 
 
-def _process_window(conn, start, end):
+def _process_window(conn, start, end, source_config):
     geom_columns = _table_columns(conn, "aa_geom")
     area_columns = _table_columns(conn, "admin_area")
     if not {"aa_id", "geom"}.issubset(geom_columns):
@@ -230,7 +268,7 @@ def _process_window(conn, start, end):
             "admin_area must contain id, aa_in_aa_id, and display_name columns"
         )
 
-    query = _submission_query(geom_columns, area_columns)
+    query = _submission_query(geom_columns, area_columns, source_config)
     cursor = conn.cursor(name="submissions_geo_export_cursor")
     cursor.itersize = INSERT_BATCH_SIZE
     cursor.execute(query, (COORDINATE_PATTERN, start, end))
@@ -317,15 +355,17 @@ def main():
     if args.start >= args.end:
         parser.error("--start must be earlier than --end")
 
-    webhook_url = os.environ.get("TEAMS_WEBHOOK_URL")
-    if not webhook_url:
-        parser.error("TEAMS_WEBHOOK_URL must be set")
-
+    webhook_url = None
     conn = None
     try:
+        source_config = _load_source_config()
+        configured_webhook = source_config["teams_webhook_url"]
+        if not configured_webhook or configured_webhook == "REPLACE_WITH_YOUR_WEBHOOK_URL":
+            raise RuntimeError("Set notifier.teams_webhook_url in config.yaml")
+        webhook_url = configured_webhook
         conn = _database_connection()
         _ensure_output_table(conn)
-        row_count = _process_window(conn, args.start, args.end)
+        row_count = _process_window(conn, args.start, args.end, source_config)
         conn.commit()
         details = (
             f"Table: {OUTPUT_TABLE} | Window: {args.start.isoformat()} to "
@@ -342,10 +382,11 @@ def main():
             f"Table: {OUTPUT_TABLE} | Window: {args.start.isoformat()} to "
             f"{args.end.isoformat()} (end exclusive) | Error: {exc}"
         )
-        try:
-            _send_teams_notification(webhook_url, "Submissions geo export failed", details, failed=True)
-        except Exception:
-            LOGGER.exception("Could not send the Teams failure notification")
+        if webhook_url:
+            try:
+                _send_teams_notification(webhook_url, "Submissions geo export failed", details, failed=True)
+            except Exception:
+                LOGGER.exception("Could not send the Teams failure notification")
         return 1
     finally:
         if conn is not None:

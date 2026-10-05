@@ -2,7 +2,7 @@
 # latlong_pipeline configuration
 # All environment-specific / frequently-changed values live here.
 # ${VAR_NAME} entries are resolved from environment variables at load time
-# (see config_loader.py) - keep real credentials out of this file / git.
+# (see config_loader.py). The Teams webhook can be set directly below.
 # =============================================================================
 
 database:
@@ -14,7 +14,7 @@ database:
   connect_timeout: 10
 
 pipeline:
-  name: "api_data_pipeline"
+  name: "data_pipeline"
   window_days: 3
   start_date: "2026-08-01T00:00:00+05:30"
   chunk_size: 500000
@@ -63,6 +63,14 @@ pipeline:
       requestid: "requestid"
       data: "data"
       created_at: "created_at"
+    submissions:
+      content: "content"
+      survey_id: "survey_id"
+      created_at: "created_at"
+    surveys:
+      id: "id"
+      name: "name"
+      bunit_id: "bunit_id"
 
   latlong_keys:
     request_path_params: ["lat", "lng", "long", "longitude", "latitude"]
@@ -79,6 +87,8 @@ tables:
   request_logs: "logs_aug_2026"
   response_logs: "response_logs_aug_2026"
   session_activities: "session_activities_aug_26"
+  submissions: "submissions"
+  surveys: "surveys"
   watermark_table: "pipeline_watermark"
   output_table: "admin_area_enriched_final"
   geom_table: "aa_geom"
@@ -95,9 +105,9 @@ geo_enrichment:
   batch_size: 25000
 
 output:
-  report_dir: "/var/www/kaviarasan/api_data_pipeline"
-  report_filename_pattern: "api_data_pipeline_report.xlsx"
+  report_dir: "/var/www/kaviarasan/data_pipeline"
+  report_filename_pattern: "data_pipeline_report.xlsx"
 
 notifier:
-  teams_webhook_url: "${TEAMS_WEBHOOK_URL}"
+  teams_webhook_url: "https://default844bd70f4af543b2808076b5ce378e.a0.environment.api.powerplatform.com:443/powerautomate/automations/direct/cu/01/workflows/4bb05b1f4b074e27b5d4e09ff7f52067/triggers/manual/paths/invoke?api-version=1&sp=%2Ftriggers%2Fmanual%2Frun&sv=1.0&sig=DGjKDc1slHgM7tpCRcLAxf0roHjzuCGvoELhW9ZcNOI"
   template_path: "./notifier_template.json"

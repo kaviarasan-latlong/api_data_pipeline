@@ -16,7 +16,7 @@ from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.operators.bash import BashOperator
 
-PIPELINE_DIR = "/var/www/kaviarasan/api_data_pipeline"
+PIPELINE_DIR = "/var/www/kaviarasan/data_pipeline"
 
 default_args = {
     "owner": "airflow",
@@ -25,7 +25,7 @@ default_args = {
 }
 
 dag = DAG(
-    "api_data_pipeline",
+    "data_pipeline",
     default_args=default_args,
     description="Extracts lat/long from API logs and geo-enriches them into admin-area hierarchy data",
     schedule="13 15 * * *",
