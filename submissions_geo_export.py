@@ -308,74 +308,6 @@ def _write_batch(conn, output_table, rows):
         )
 
 
-def _diagnose_empty_export(conn, start, end, source_config):
-    submission_columns = {
-        key: f'"{value}"' for key, value in source_config["submission_columns"].items()
-    }
-    survey_columns = {
-        key: f'"{value}"' for key, value in source_config["survey_columns"].items()
-    }
-    submissions_table = f'"{source_config["submissions_table"]}"'
-    surveys_table = f'"{source_config["survey_table"]}"'
-    sql = f"""
-        WITH source_rows AS (
-            SELECT s.{submission_columns['survey_id']} AS survey_id,
-                   s.{submission_columns['content']}::text AS content
-            FROM {submissions_table} s
-            WHERE s.{submission_columns['server_created_at']} >= %s
-              AND s.{submission_columns['server_created_at']} < %s
-        ), evaluated AS (
-            SELECT sr.content,
-                   sv.{survey_columns['id']} IS NOT NULL AS survey_found,
-                   regexp_match(sr.content, %s) AS coordinate_parts
-            FROM source_rows sr
-            LEFT JOIN {surveys_table} sv
-              ON sv.{survey_columns['id']} = sr.survey_id
-        )
-        SELECT COUNT(*),
-               COUNT(*) FILTER (WHERE survey_found),
-               COUNT(*) FILTER (WHERE coordinate_parts IS NOT NULL),
-               COUNT(*) FILTER (
-                   WHERE coordinate_parts IS NOT NULL
-                     AND coordinate_parts[1]::double precision BETWEEN -90 AND 90
-                     AND coordinate_parts[2]::double precision BETWEEN -180 AND 180
-               )
-        FROM evaluated
-    """
-    with conn.cursor() as cursor:
-        cursor.execute(sql, (start, end, COORDINATE_PATTERN))
-        source_count, survey_matches, coordinate_matches, valid_points = cursor.fetchone()
-
-    if source_count == 0:
-        reason = "no submissions have server_created_at inside the window"
-    elif coordinate_matches == 0:
-        reason = "submissions exist, but the coordinate regex matched no content"
-    elif valid_points == 0:
-        reason = "coordinates matched, but all were outside valid latitude/longitude ranges"
-    elif survey_matches == 0:
-        reason = (
-            "no submissions joined to the configured surveys table; coordinate-valid "
-            "rows are retained with NULL name and bunit_id"
-        )
-    elif survey_matches < source_count:
-        reason = (
-            f"{source_count - survey_matches} submissions did not join to surveys; "
-            "those rows are retained with NULL name and bunit_id"
-        )
-    else:
-        reason = "valid points were found; check the exporter query or insert conflict behavior"
-
-    LOGGER.warning(
-        "Anuga export wrote zero rows: %s. Diagnostics: submissions=%s, "
-        "survey_matches=%s, coordinate_matches=%s, valid_points=%s.",
-        reason,
-        source_count,
-        survey_matches,
-        coordinate_matches,
-        valid_points,
-    )
-
-
 def _process_window(conn, start, end, source_config):
     geom_columns = _table_columns(conn, "aa_geom")
     area_columns = _table_columns(conn, "admin_area")
@@ -518,8 +450,6 @@ def main():
         stage = "Anuga export"
         _ensure_output_table(conn, source_config["output_table"])
         row_count = _process_window(conn, window_start, window_end, source_config)
-        if row_count == 0:
-            _diagnose_empty_export(conn, window_start, window_end, source_config)
         conn.commit()
         stage = "monthly report refresh"
         monthly_reports = metrics.update_monthly_report_workbooks(
