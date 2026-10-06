@@ -196,7 +196,7 @@ def _resolve_admin_hierarchy_bulk(conn, cfg, area_ids: list):
                 state = _clean_area_name(name)
                 break
 
-        if pincode and district and state:
+        if pincode:
             results[start_id] = {
                 "pincode": pincode,
                 "district": district,
@@ -270,6 +270,14 @@ def _enrich_batch(conn, cfg, batch: list[dict]):
         if idx not in by_idx:
             by_idx[idx] = row[1]  # geom_a_id (= area start id)
 
+    unmatched_points = len(batch) - len(by_idx)
+    if unmatched_points:
+        logger.info(
+            "Geo lookup: %d/%d coordinates did not intersect an active aa_geom pincode area.",
+            unmatched_points,
+            len(batch),
+        )
+
     # --- OPTIMIZATION: bulk resolve all area_ids at once via recursive CTE ---
     unique_area_ids = list(set(by_idx.values()))
     hierarchy_cache = _resolve_admin_hierarchy_bulk(conn, cfg, unique_area_ids)
@@ -291,7 +299,6 @@ def enrich_rows(conn, cfg, rows: list[dict]):
         return rows
 
     batch_size = cfg["geo_enrichment"].get("batch_size", 5000)
-    enriched_count = 0
 
     for start in range(0, len(to_enrich_idx), batch_size):
         idx_slice = to_enrich_idx[start:start + batch_size]
@@ -306,17 +313,22 @@ def enrich_rows(conn, cfg, rows: list[dict]):
             row["pincode"] = row.get("pincode") or geo.get("pincode")
             row["district"] = row.get("district") or geo.get("district")
             row["state"] = row.get("state") or geo.get("state")
-            enriched_count += 1
 
-    for row in rows:
-        if not (row.get("pincode") and row.get("district") and row.get("state")):
-            row["pincode"] = None
-            row["district"] = None
-            row["state"] = None
+    complete_count = sum(
+        bool(row.get("pincode") and row.get("district") and row.get("state"))
+        for row in rows
+    )
+    partial_count = sum(
+        bool(row.get("pincode") or row.get("district") or row.get("state"))
+        and not (row.get("pincode") and row.get("district") and row.get("state"))
+        for row in rows
+    )
+    unresolved_count = len(rows) - complete_count - partial_count
 
     logger.info(
-        "Stage 2 geo enrichment: %d/%d rows needed lookup, %d resolved to an area.",
-        len(to_enrich_idx), len(rows), enriched_count,
+        "Stage 2 geo enrichment: %d/%d rows needed lookup; %d complete, "
+        "%d partial, %d unresolved geographic triplets.",
+        len(to_enrich_idx), len(rows), complete_count, partial_count, unresolved_count,
     )
     return rows
 
