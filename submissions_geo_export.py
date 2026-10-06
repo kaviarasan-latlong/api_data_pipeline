@@ -229,7 +229,7 @@ def _submission_query(geom_columns, area_columns, source_config):
                 coordinate_match.parts[1]::double precision AS latitude,
                 coordinate_match.parts[2]::double precision AS longitude
                         FROM {submissions_table} s
-                        JOIN {survey_table} sv
+                        LEFT JOIN {survey_table} sv
                             ON sv.{survey_columns['id']} = s.{submission_columns['survey_id']}
             CROSS JOIN LATERAL (
                                 SELECT regexp_match(s.{submission_columns['content']}::text, %s) AS parts
@@ -334,7 +334,7 @@ def _diagnose_empty_export(conn, start, end, source_config):
         )
         SELECT COUNT(*),
                COUNT(*) FILTER (WHERE survey_found),
-               COUNT(*) FILTER (WHERE survey_found AND coordinate_parts IS NOT NULL),
+               COUNT(*) FILTER (WHERE coordinate_parts IS NOT NULL),
                COUNT(*) FILTER (
                    WHERE coordinate_parts IS NOT NULL
                      AND coordinate_parts[1]::double precision BETWEEN -90 AND 90
@@ -348,12 +348,20 @@ def _diagnose_empty_export(conn, start, end, source_config):
 
     if source_count == 0:
         reason = "no submissions have server_created_at inside the window"
-    elif survey_matches == 0:
-        reason = "submissions exist, but none joined to the configured surveys table"
     elif coordinate_matches == 0:
-        reason = "survey joins exist, but the coordinate regex matched no content"
+        reason = "submissions exist, but the coordinate regex matched no content"
     elif valid_points == 0:
         reason = "coordinates matched, but all were outside valid latitude/longitude ranges"
+    elif survey_matches == 0:
+        reason = (
+            "no submissions joined to the configured surveys table; coordinate-valid "
+            "rows are retained with NULL name and bunit_id"
+        )
+    elif survey_matches < source_count:
+        reason = (
+            f"{source_count - survey_matches} submissions did not join to surveys; "
+            "those rows are retained with NULL name and bunit_id"
+        )
     else:
         reason = "valid points were found; check the exporter query or insert conflict behavior"
 

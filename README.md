@@ -337,7 +337,9 @@ The source tables are `submissions` and `surveys`. The job reads
 the name and `bunit_id` from `surveys`. It extracts the
 first decimal latitude/longitude pair from the content, filters submissions by
 `server_created_at`, and uses `aa_geom` and `admin_area` to look up state, district,
-and pincode. Rows without a valid coordinate pair are skipped.
+and pincode. The survey join is left-sided: coordinate-valid submissions are
+kept even when `survey_id` has no matching survey, with `name` and `bunit_id`
+left null. Rows without a valid coordinate pair are skipped.
 
 The source table names are configured under `tables` in `config.yaml`; their
 required fields are mapped under `pipeline.columns.submissions` and
