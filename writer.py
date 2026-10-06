@@ -26,7 +26,8 @@ CREATE TABLE IF NOT EXISTS {table} (
     state               TEXT,
     district            TEXT,
     pincode             TEXT,
-    address             TEXT
+    address             TEXT,
+    created_at          TIMESTAMPTZ
 );
 """
 
@@ -35,12 +36,18 @@ STAGING_TABLE_SUFFIX = "_staging"
 OUTPUT_COLUMNS = [
     "bunit_id", "tenant_id", "api_type", "api_version",
     "latitude", "longitude", "state", "district", "pincode", "address",
+    "created_at",
 ]
 
 
 def ensure_output_table(conn, table: str):
     with conn.cursor() as cur:
         cur.execute(CREATE_OUTPUT_TABLE_SQL.format(table=table))
+        cur.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ")
+        cur.execute(
+            f"CREATE INDEX IF NOT EXISTS {table}_created_at_idx "
+            f"ON {table} (created_at)"
+        )
     conn.commit()
 
 
@@ -59,6 +66,7 @@ def _rows_to_csv_buffer(rows: list[dict]) -> io.StringIO:
             r.get("district"),
             r.get("pincode"),
             r.get("address"),
+            r.get("created_at"),
         ])
     buf.seek(0)
     return buf

@@ -59,7 +59,8 @@ def _clean_area_name(value):
     text = str(value).strip()
     if not text:
         return None
-    return re.sub(r"^\d{6}\s*[-–]?\s*", "", text).strip()
+    cleaned = re.sub(r"^\d{6}\s*[-–]?\s*", "", text).strip()
+    return cleaned or None
 
 
 def _parse_pincode(value):
@@ -69,6 +70,18 @@ def _parse_pincode(value):
     if not match:
         return None
     return match.group(1)
+
+
+def _normalize_source_geo_fields(row):
+    row["pincode"] = _parse_pincode(row.get("pincode"))
+    invalid_values = {"", "yes", "no", "true", "false", "null", "none", "n/a", "na"}
+    for field in ("state", "district"):
+        value = row.get(field)
+        if value is None or isinstance(value, bool):
+            row[field] = None
+            continue
+        text = str(value).strip()
+        row[field] = None if text.casefold() in invalid_values else text or None
 
 
 # ---------------------------------------------------------------------------
@@ -183,14 +196,14 @@ def _resolve_admin_hierarchy_bulk(conn, cfg, area_ids: list):
                 state = _clean_area_name(name)
                 break
 
-        if pincode is None:
-            results[start_id] = {"pincode": None, "district": None, "state": None}
-        else:
+        if pincode and district and state:
             results[start_id] = {
                 "pincode": pincode,
                 "district": district,
                 "state": state,
             }
+        else:
+            results[start_id] = {"pincode": None, "district": None, "state": None}
 
     return results
 
@@ -270,6 +283,9 @@ def _enrich_batch(conn, cfg, batch: list[dict]):
 
 
 def enrich_rows(conn, cfg, rows: list[dict]):
+    for row in rows:
+        _normalize_source_geo_fields(row)
+
     to_enrich_idx = [i for i, r in enumerate(rows) if _needs_enrichment(r)]
     if not to_enrich_idx:
         return rows
@@ -291,6 +307,12 @@ def enrich_rows(conn, cfg, rows: list[dict]):
             row["district"] = row.get("district") or geo.get("district")
             row["state"] = row.get("state") or geo.get("state")
             enriched_count += 1
+
+    for row in rows:
+        if not (row.get("pincode") and row.get("district") and row.get("state")):
+            row["pincode"] = None
+            row["district"] = None
+            row["state"] = None
 
     logger.info(
         "Stage 2 geo enrichment: %d/%d rows needed lookup, %d resolved to an area.",

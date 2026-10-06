@@ -301,6 +301,21 @@ This table stores results such as:
 - `pincode`
 - `address`
 
+## Monthly reports
+
+After each successful processing window, the pipeline refreshes monthly report
+folders under the configured `output.report_dir`. Each folder contains four
+workbooks: `latlong`, `automobiles`, `bfsi`, and `others`. The full `latlong`
+workbook and each group workbook have `pincode`, `district`, and `state` sheets;
+the pincode sheet includes district and state, and the district sheet includes
+state. Counts are grouped by geographic hierarchy and filtered by the editable
+`output.report_groups` business-unit and tenant ID lists in `config.yaml`.
+
+The output table stores each source row's `created_at` for monthly attribution.
+Rows written before this column is available have no recoverable processing
+month and are excluded from monthly reports. When a completed month has all
+four workbooks, the preceding month's report folder is removed.
+
 ---
 
 ## 12. Standalone submissions export

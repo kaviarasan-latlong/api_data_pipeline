@@ -305,10 +305,14 @@ def run():
         pipeline_elapsed = time.monotonic() - pipeline_start
         logger.info("Window complete in %.1fs. Totals: %s", pipeline_elapsed, totals)
 
-        window_counts = metrics.compute_window_counts(conn, cfg, window_start, window_end)
-        report_path = metrics.update_report_workbook(cfg, window_counts, window_end)
+        monthly_reports = metrics.update_monthly_report_workbooks(
+            conn, cfg, window_start, window_end,
+        )
+        latest_month_reports = list(monthly_reports.values())[-1]
+        report_path = latest_month_reports["latlong"]
         run_summary = metrics.build_run_summary(pipeline_name, window_start, window_end, totals, report_path)
         run_summary["output_table"] = output_table
+        run_summary["report_paths"] = monthly_reports
         notifier.send_notification(cfg, run_summary)
 
     except Exception as exc:

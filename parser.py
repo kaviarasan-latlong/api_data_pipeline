@@ -46,6 +46,22 @@ FIELD_KEY_RE = {
 }
 
 FAILURE_VALUES = {"failure", "failed", "error", "err"}
+INVALID_GEO_VALUES = {"", "yes", "no", "true", "false", "null", "none", "n/a", "na"}
+PINCODE_VALUE_RE = re.compile(r"^\s*(\d{6})(?:\s*[-–]\s*.*)?\s*$")
+
+
+def _normalize_geo_field(field, value):
+    if value is None or isinstance(value, bool):
+        return None
+
+    text = str(value).strip()
+    if field == "pincode":
+        match = PINCODE_VALUE_RE.match(text)
+        return match.group(1) if match else None
+
+    if not isinstance(value, str) or text.casefold() in INVALID_GEO_VALUES:
+        return None
+    return text
 
 
 def _as_float(v):
@@ -61,7 +77,9 @@ def _extract_point_latlng(value):
     match = POINT_RE.search(value)
     if not match:
         return None
-    return (float(match.group(1)), float(match.group(2)))
+    longitude = float(match.group(1))
+    latitude = float(match.group(2))
+    return (latitude, longitude)
 
 
 def _extract_first_coordinate_pair(value):
@@ -107,10 +125,10 @@ def _find_latlong_in_obj(obj):
                     lat = _as_float(v)
                 elif LNG_KEY_RE.match(str(k)):
                     lng = _as_float(v)
-            elif isinstance(v, str):
-                point = _extract_point_latlng(v)
-                if point is not None and lat is None and lng is None:
-                    return point
+                elif isinstance(v, str):
+                    point = _extract_point_latlng(v)
+                    if point is not None and lat is None and lng is None:
+                        return point
         if lat is not None and lng is not None:
             return (lat, lng)
         for v in obj.values():
@@ -140,7 +158,9 @@ def _find_fields_in_obj(obj, found=None):
             if isinstance(v, (str, int)):
                 for field, pattern in FIELD_KEY_RE.items():
                     if field not in found and pattern.match(str(k)):
-                        found[field] = str(v)
+                        value = _normalize_geo_field(field, v)
+                        if value is not None:
+                            found[field] = value
             elif isinstance(v, (dict, list)):
                 _find_fields_in_obj(v, found)
     elif isinstance(obj, list):

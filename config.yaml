@@ -106,7 +106,18 @@ geo_enrichment:
 
 output:
   report_dir: "/var/www/kaviarasan/data_pipeline"
-  report_filename_pattern: "data_pipeline_report.xlsx"
+  monthly_report_folder_pattern: "data_pipeline_report_{month}_{year}"
+  monthly_report_filename_pattern: "{report_type}_{month}_{year}.xlsx"
+  report_groups:
+    automobiles:
+      bunit_ids: [301, 540, 582, 273, 602, 370, 514, 577, 601, 406]
+      tenant_ids: ["10002385"]
+    bfsi:
+      bunit_ids: [379]
+      tenant_ids: []
+    others:
+      bunit_ids: [251, 199, 302, 531]
+      tenant_ids: ["10001577"]
 
 notifier:
   teams_webhook_url: "https://default844bd70f4af543b2808076b5ce378e.a0.environment.api.powerplatform.com:443/powerautomate/automations/direct/cu/01/workflows/4bb05b1f4b074e27b5d4e09ff7f52067/triggers/manual/paths/invoke?api-version=1&sp=%2Ftriggers%2Fmanual%2Frun&sv=1.0&sig=DGjKDc1slHgM7tpCRcLAxf0roHjzuCGvoELhW9ZcNOI"
