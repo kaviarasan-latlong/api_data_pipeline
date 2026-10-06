@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Entry point called by the Airflow DAG (api_dag.py).
+# Entry point called by the Airflow DAG (data_dag.py).
 # Activates the pipeline's Python environment and runs one pipeline
 # invocation (one window; main.py itself loops chunks within the window).
 

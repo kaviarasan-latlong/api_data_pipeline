@@ -1,7 +1,7 @@
 """
 main.py
 
-Entry point invoked by run_pipeline.sh (in turn triggered by api_dag.py).
+Entry point invoked by run_pipeline.sh (in turn triggered by data_dag.py).
 
     determine window (watermark.py)
       -> for each chunk (extractor.py):

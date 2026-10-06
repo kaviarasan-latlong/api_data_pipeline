@@ -41,7 +41,7 @@ The pipeline follows the server-side requirements used by this project:
 
 ```text
 data_pipeline/
-├── api_dag.py
+├── data_dag.py
 ├── config.yaml
 ├── config_loader.py
 ├── extractor.py
@@ -222,7 +222,7 @@ bash run_pipeline.sh
 
 ## 8. Airflow usage
 
-This project includes `api_dag.py` for Airflow scheduling.
+This project includes `data_dag.py` for Airflow scheduling.
 
 The DAG invokes the project shell wrapper so the real logic remains in Python and Airflow is just the scheduler/trigger layer.
 
