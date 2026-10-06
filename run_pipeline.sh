@@ -28,5 +28,7 @@ else
 fi
 
 cd "$PIPELINE_DIR"
+export PIPELINE_RUN_STARTED_AT="$(date +%s)"
+export PIPELINE_DEFER_SUCCESS_NOTIFICATION=1
 "$PYTHON_BIN" main.py
 "$PYTHON_BIN" submissions_geo_export.py --from-watermark

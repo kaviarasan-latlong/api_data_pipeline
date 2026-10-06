@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -36,6 +37,17 @@ def _parse_timestamp(value):
         raise argparse.ArgumentTypeError(
             f"Invalid ISO-8601 timestamp: {value}"
         ) from exc
+
+
+def _format_duration(seconds):
+    total_seconds = max(0, int(seconds))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes}m {seconds}s"
+    if minutes:
+        return f"{minutes}m {seconds}s"
+    return f"{seconds}s"
 
 
 def _database_connection(database_config):
@@ -208,7 +220,7 @@ def _submission_query(geom_columns, area_columns, source_config):
     }
 
     return f"""
-        WITH extracted AS (
+        WITH RECURSIVE extracted AS (
             SELECT
                 row_number() OVER () AS row_id,
                 s.{submission_columns['server_created_at']} AS server_created_at,
@@ -418,6 +430,9 @@ def main():
 
     webhook_url = None
     conn = None
+    export_started = time.monotonic()
+    pipeline_started_at = os.environ.get("PIPELINE_RUN_STARTED_AT")
+    stage = "configuration and database connection"
     try:
         source_config = _load_source_config()
         configured_webhook = source_config["teams_webhook_url"]
@@ -432,18 +447,30 @@ def main():
         else:
             window_start, window_end = args.start, args.end
 
+        stage = "Anuga export"
         _ensure_output_table(conn, source_config["output_table"])
         row_count = _process_window(conn, window_start, window_end, source_config)
         conn.commit()
+        stage = "monthly report refresh"
         monthly_reports = metrics.update_monthly_report_workbooks(
             conn, source_config["config"], window_start, window_end,
         )
+        elapsed = (
+            time.time() - float(pipeline_started_at)
+            if pipeline_started_at
+            else time.monotonic() - export_started
+        )
+        duration_label = "Full API + Anuga duration" if pipeline_started_at else "Anuga export duration"
+        api_table = source_config["config"]["tables"]["output_table"]
         details = (
-            f"Table: {source_config['output_table']} | Window: {window_start.isoformat()} to "
-            f"{window_end.isoformat()} (end exclusive) | Rows processed: {row_count}"
+            f"Status: SUCCESS | API output table: {api_table} | "
+            f"Anuga output table: {source_config['output_table']} | "
+            f"Window: {window_start.isoformat()} to {window_end.isoformat()} (end exclusive) | "
+            f"Anuga rows written or already present: {row_count} | "
+            f"{duration_label}: {_format_duration(elapsed)}"
         )
         try:
-            _send_teams_notification(webhook_url, "Submissions geo export completed", details)
+            _send_teams_notification(webhook_url, "API and Anuga pipeline completed", details)
         except Exception as notification_error:
             LOGGER.error(
                 "Anuga export and monthly reports completed, but Teams notification failed: %s",
@@ -461,13 +488,29 @@ def main():
         LOGGER.exception("Submissions geo export failed")
         window_start = locals().get("window_start", args.start)
         window_end = locals().get("window_end", args.end)
+        elapsed = (
+            time.time() - float(pipeline_started_at)
+            if pipeline_started_at
+            else time.monotonic() - export_started
+        )
+        api_table = (
+            source_config["config"]["tables"]["output_table"]
+            if "source_config" in locals()
+            else "admin_area_enriched_final"
+        )
+        anuga_table = (
+            source_config["output_table"]
+            if "source_config" in locals()
+            else "anuga_final"
+        )
         details = (
-            f"Table: {source_config['output_table'] if 'source_config' in locals() else 'anuga_final'} | "
-            f"Window: {window_start} to {window_end} (end exclusive) | Error: {exc}"
+            f"Status: FAILED | API output table: {api_table} | Anuga output table: {anuga_table} | "
+            f"Failed stage: {stage} | Window: {window_start} to {window_end} (end exclusive) | "
+            f"Full duration: {_format_duration(elapsed)} | Issue: {exc}"
         )
         if webhook_url:
             try:
-                _send_teams_notification(webhook_url, "Submissions geo export failed", details, failed=True)
+                _send_teams_notification(webhook_url, "API and Anuga pipeline failed", details, failed=True)
             except Exception:
                 LOGGER.exception("Could not send the Teams failure notification")
         return 1

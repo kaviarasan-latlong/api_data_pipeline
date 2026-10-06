@@ -54,6 +54,14 @@ def _build_adaptive_card(run_summary: dict, message: str, style: str = "Attentio
 
     if "failure_message" in run_summary:
         body.append({"type": "TextBlock", "text": f"Failure: {run_summary.get('failure_message')}", "wrap": True})
+    if run_summary.get("table_details"):
+        body.append({"type": "TextBlock", "text": run_summary["table_details"], "wrap": True})
+    if run_summary.get("duration_seconds") is not None:
+        body.append({
+            "type": "TextBlock",
+            "text": f"Duration: {run_summary['duration_seconds']} seconds",
+            "wrap": True,
+        })
 
     return {
         "type": "message",

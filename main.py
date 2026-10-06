@@ -313,13 +313,18 @@ def run():
         run_summary = metrics.build_run_summary(pipeline_name, window_start, window_end, totals, report_path)
         run_summary["output_table"] = output_table
         run_summary["report_paths"] = monthly_reports
-        try:
-            notifier.send_notification(cfg, run_summary)
-        except Exception as notification_error:
-            logger.error(
-                "Processing and reports succeeded, but Teams notification failed: %s",
-                notification_error,
-            )
+        run_summary["duration_seconds"] = round(time.monotonic() - pipeline_start, 1)
+        run_summary["table_details"] = f"API output table: {output_table}"
+        if os.environ.get("PIPELINE_DEFER_SUCCESS_NOTIFICATION") == "1":
+            logger.info("API success notification deferred until Anuga export completes.")
+        else:
+            try:
+                notifier.send_notification(cfg, run_summary)
+            except Exception as notification_error:
+                logger.error(
+                    "Processing and reports succeeded, but Teams notification failed: %s",
+                    notification_error,
+                )
 
     except Exception as exc:
         logger.exception("Pipeline run failed - marking window FAILED for retry/resume.")
@@ -338,7 +343,16 @@ def run():
             "dropped_no_latlong": 0,
             "report_path": "n/a",
             "output_table": output_table,
-            "failure_message": str(exc),
+            "failure_message": (
+                f"API stage failed: {exc}. Anuga export was not run."
+                if os.environ.get("PIPELINE_DEFER_SUCCESS_NOTIFICATION") == "1"
+                else str(exc)
+            ),
+            "duration_seconds": round(time.monotonic() - pipeline_start, 1),
+            "table_details": (
+                f"API output table: {output_table}; "
+                f"Anuga output table: {cfg['tables'].get('anuga_output_table', 'n/a')}"
+            ),
         }
         try:
             notifier.send_notification(cfg, failure_summary)
