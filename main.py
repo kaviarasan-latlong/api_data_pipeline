@@ -313,7 +313,13 @@ def run():
         run_summary = metrics.build_run_summary(pipeline_name, window_start, window_end, totals, report_path)
         run_summary["output_table"] = output_table
         run_summary["report_paths"] = monthly_reports
-        notifier.send_notification(cfg, run_summary)
+        try:
+            notifier.send_notification(cfg, run_summary)
+        except Exception as notification_error:
+            logger.error(
+                "Processing and reports succeeded, but Teams notification failed: %s",
+                notification_error,
+            )
 
     except Exception as exc:
         logger.exception("Pipeline run failed - marking window FAILED for retry/resume.")

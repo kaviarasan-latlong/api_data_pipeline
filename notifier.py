@@ -97,11 +97,19 @@ def send_notification(cfg, run_summary: dict):
 
     try:
         resp = requests.post(webhook_url, json=payload, timeout=15)
-        if resp.status_code >= 300:
-            logger.error("Teams notification failed: %s %s", resp.status_code, resp.text)
-            resp.raise_for_status()
-    except Exception:
-        logger.exception("Teams notification failed")
-        raise
+    except requests.RequestException as exc:
+        error_type = type(exc).__name__
+        logger.error("Teams notification request failed (%s)", error_type)
+        raise RuntimeError(
+            f"Teams notification request failed ({error_type})"
+        ) from None
+
+    if resp.status_code >= 300:
+        logger.error(
+            "Teams notification failed: HTTP %s %s",
+            resp.status_code,
+            resp.text,
+        )
+        raise RuntimeError(f"Teams notification failed with HTTP {resp.status_code}")
 
     logger.info("Teams notification sent for window %s -> %s", run_summary.get("window_start"), run_summary.get("window_end"))

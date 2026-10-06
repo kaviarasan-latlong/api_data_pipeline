@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Entry point called by the Airflow DAG (data_dag.py).
-# Activates the pipeline's Python environment and runs one pipeline
-# invocation (one window; main.py itself loops chunks within the window).
+# Activates the pipeline's Python environment, runs one API window, then
+# exports Anuga submissions for that successful window.
 
 set -euo pipefail
 
@@ -28,4 +28,5 @@ else
 fi
 
 cd "$PIPELINE_DIR"
-exec "$PYTHON_BIN" main.py
+"$PYTHON_BIN" main.py
+"$PYTHON_BIN" submissions_geo_export.py --from-watermark

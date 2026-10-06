@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Standalone export of submission coordinates and their admin areas.
+"""Export submission coordinates and their admin areas.
 
-Run with PGHOST, PGPORT, PGDATABASE, and PGPASSWORD set, then provide an
-ISO-8601 start and end window. The Teams webhook is read from config.yaml.
-The end timestamp is exclusive and filters submissions.server_created_at.
-This file is intentionally not wired into
-the API data pipeline.
+The Airflow DAG runs this after the API pipeline using its latest successful
+watermark window. For a manual backfill, provide an ISO-8601 start and end
+window. The end timestamp is exclusive and filters
+submissions.server_created_at.
 """
 
 import argparse
@@ -20,6 +19,8 @@ import psycopg2
 import requests
 import yaml
 from psycopg2.extras import execute_values
+
+import metrics
 
 
 LOGGER = logging.getLogger("submissions_geo_export")
@@ -47,21 +48,17 @@ def _database_connection(database_config):
 
     user = os.environ.get("PGUSER") or database_config.get("user")
     password = os.environ.get("PGPASSWORD") or database_config.get("password")
-    missing = [
-        name for name, value in (("PGUSER", user), ("PGPASSWORD", password))
-        if not value
-    ]
-    if missing:
-        raise RuntimeError("Missing database environment variables: " + ", ".join(missing))
-
-    return psycopg2.connect(
-        host=database_config["host"],
-        port=database_config["port"],
-        dbname=dbname,
-        user=user,
-        password=password,
-        connect_timeout=int(database_config.get("connect_timeout", 10)),
-    )
+    connection_options = {
+        "host": database_config["host"],
+        "port": database_config["port"],
+        "dbname": dbname,
+        "connect_timeout": int(database_config.get("connect_timeout", 10)),
+    }
+    if user:
+        connection_options["user"] = user
+    if password:
+        connection_options["password"] = password
+    return psycopg2.connect(**connection_options)
 
 
 def _load_source_config():
@@ -73,9 +70,12 @@ def _load_source_config():
     columns = config["pipeline"]["columns"]
     source_config = {
         "database": config["database"],
+        "config": config,
+        "pipeline_name": config["pipeline"]["name"],
         "submissions_table": tables["submissions"],
         "survey_table": tables["surveys"],
         "output_table": tables["anuga_output_table"],
+        "watermark_table": tables["watermark_table"],
         "submission_columns": columns["submissions"],
         "survey_columns": columns["surveys"],
         "teams_webhook_url": config["notifier"]["teams_webhook_url"],
@@ -90,6 +90,24 @@ def _load_source_config():
     if invalid:
         raise ValueError(f"Invalid SQL identifiers in config.yaml: {invalid}")
     return source_config
+
+
+def _latest_successful_pipeline_window(conn, source_config):
+    with conn.cursor() as cursor:
+        cursor.execute(
+            f"""
+            SELECT window_start, window_end
+            FROM {source_config['watermark_table']}
+            WHERE pipeline_name = %s AND status = 'SUCCESS'
+            ORDER BY window_end DESC
+            LIMIT 1
+            """,
+            (source_config["pipeline_name"],),
+        )
+        row = cursor.fetchone()
+    if row is None:
+        raise RuntimeError("No successful API pipeline window is available for Anuga export")
+    return row
 
 
 def _table_columns(conn, table_name):
@@ -365,19 +383,37 @@ def _send_teams_notification(webhook_url, title, details, failed=False):
             }
         ],
     }
-    response = requests.post(webhook_url, json=payload, timeout=15)
-    response.raise_for_status()
+    try:
+        response = requests.post(webhook_url, json=payload, timeout=15)
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            f"Teams notification request failed ({type(exc).__name__})"
+        ) from None
+    if response.status_code >= 300:
+        LOGGER.error(
+            "Teams notification failed: HTTP %s %s",
+            response.status_code,
+            response.text,
+        )
+        raise RuntimeError(f"Teams notification failed with HTTP {response.status_code}")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--start", required=True, type=_parse_timestamp,
+    parser.add_argument("--from-watermark", action="store_true",
+                        help="Use the latest successful API pipeline window")
+    parser.add_argument("--start", type=_parse_timestamp,
                         help="Inclusive server_created_at window start (ISO-8601)")
-    parser.add_argument("--end", required=True, type=_parse_timestamp,
+    parser.add_argument("--end", type=_parse_timestamp,
                         help="Exclusive server_created_at window end (ISO-8601)")
     args = parser.parse_args()
 
-    if args.start >= args.end:
+    if args.from_watermark:
+        if args.start is not None or args.end is not None:
+            parser.error("--from-watermark cannot be combined with --start/--end")
+    elif args.start is None or args.end is None:
+        parser.error("provide both --start and --end, or use --from-watermark")
+    elif args.start >= args.end:
         parser.error("--start must be earlier than --end")
 
     webhook_url = None
@@ -389,24 +425,45 @@ def main():
             raise RuntimeError("Set notifier.teams_webhook_url in config.yaml")
         webhook_url = configured_webhook
         conn = _database_connection(source_config["database"])
+        if args.from_watermark:
+            window_start, window_end = _latest_successful_pipeline_window(
+                conn, source_config,
+            )
+        else:
+            window_start, window_end = args.start, args.end
+
         _ensure_output_table(conn, source_config["output_table"])
-        row_count = _process_window(conn, args.start, args.end, source_config)
+        row_count = _process_window(conn, window_start, window_end, source_config)
         conn.commit()
-        details = (
-            f"Table: {source_config['output_table']} | Window: {args.start.isoformat()} to "
-            f"{args.end.isoformat()} (end exclusive) | Rows processed: {row_count}"
+        monthly_reports = metrics.update_monthly_report_workbooks(
+            conn, source_config["config"], window_start, window_end,
         )
-        _send_teams_notification(webhook_url, "Submissions geo export completed", details)
-        LOGGER.info("Export completed; %d rows written or already present.", row_count)
+        details = (
+            f"Table: {source_config['output_table']} | Window: {window_start.isoformat()} to "
+            f"{window_end.isoformat()} (end exclusive) | Rows processed: {row_count}"
+        )
+        try:
+            _send_teams_notification(webhook_url, "Submissions geo export completed", details)
+        except Exception as notification_error:
+            LOGGER.error(
+                "Anuga export and monthly reports completed, but Teams notification failed: %s",
+                notification_error,
+            )
+        LOGGER.info(
+            "Export completed; %d rows written or already present. Refreshed reports: %s",
+            row_count,
+            monthly_reports,
+        )
         return 0
     except Exception as exc:
         if conn is not None:
             conn.rollback()
         LOGGER.exception("Submissions geo export failed")
+        window_start = locals().get("window_start", args.start)
+        window_end = locals().get("window_end", args.end)
         details = (
             f"Table: {source_config['output_table'] if 'source_config' in locals() else 'anuga_final'} | "
-            f"Window: {args.start.isoformat()} to "
-            f"{args.end.isoformat()} (end exclusive) | Error: {exc}"
+            f"Window: {window_start} to {window_end} (end exclusive) | Error: {exc}"
         )
         if webhook_url:
             try:

@@ -224,7 +224,10 @@ bash run_pipeline.sh
 
 This project includes `data_dag.py` for Airflow scheduling.
 
-The DAG invokes the project shell wrapper so the real logic remains in Python and Airflow is just the scheduler/trigger layer.
+The DAG has one task that calls `run_pipeline.sh`. The wrapper runs the API
+pipeline first, then runs `submissions_geo_export.py --from-watermark` with the
+same Python interpreter. The export reuses the latest successful API window
+and refreshes the monthly reports after updating `anuga_final`.
 
 The expected pattern is:
 
@@ -322,11 +325,12 @@ has all four workbooks, the preceding month's report folder is removed.
 
 ---
 
-## 12. Standalone submissions export
+## 12. Anuga submissions export
 
-`submissions_geo_export.py` is a separate command-line job. It is not called by
-`main.py`, `run_pipeline.sh`, or the Airflow DAG. Run it manually when the
-submissions export is needed, for example after the API pipeline has completed.
+`submissions_geo_export.py` runs as the second task in `data_dag.py`, after the
+API pipeline succeeds. It uses the latest successful watermark window, so its
+`server_created_at` range matches the API window. It refreshes the monthly
+reports after writing `anuga_final`.
 
 The source tables are `submissions` and `surveys`. The job reads
 `submissions.content`, joins `submissions.survey_id` to `surveys.id`, and gets
@@ -359,8 +363,8 @@ Set `notifier.teams_webhook_url` in `config.yaml` to the Teams webhook URL.
 Both this standalone export and the API pipeline read the webhook from that
 setting; `run_pipeline.sh` does not override it.
 
-Provide the start and end of the `server_created_at` window as ISO-8601 timestamps.
-The start is inclusive and the end is exclusive:
+For a manual backfill, provide the start and end of the `server_created_at`
+window as ISO-8601 timestamps. The start is inclusive and the end is exclusive:
 
 ```bash
 python3 submissions_geo_export.py \
@@ -368,9 +372,8 @@ python3 submissions_geo_export.py \
   --end 2026-10-02T00:00:00+05:30
 ```
 
-The job sends a distinct Teams notification for success or failure. Database
-errors roll back the current run and return a non-zero exit status. This export
-does not change the API pipeline's configuration, tables, or notifications.
+The export sends a Teams notification for success or failure. Database errors
+roll back the current run and return a non-zero exit status.
 
 ---
 

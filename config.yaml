@@ -121,5 +121,5 @@ output:
       tenant_ids: ["10001577"]
 
 notifier:
-  teams_webhook_url: "https://default844bd70f4af543b2808076b5ce378e.a0.environment.api.powerplatform.com:443/powerautomate/automations/direct/cu/01/workflows/4bb05b1f4b074e27b5d4e09ff7f52067/triggers/manual/paths/invoke?api-version=1&sp=%2Ftriggers%2Fmanual%2Frun&sv=1.0&sig=DGjKDc1slHgM7tpCRcLAxf0roHjzuCGvoELhW9ZcNOI"
+  teams_webhook_url: "https://default844bd70f4af543b2808076b5ce378e.a0.environment.api.powerplatform.com:443/powerautomate/automations/direct/cu/24/workflows/75c23c0792134ef599e11e2b75f846a0/triggers/manual/paths/invoke?api-version=1&sp=%2Ftriggers%2Fmanual%2Frun&sv=1.0&sig=Mtv4B-a9UXW7GCvnz5R2lXfDySk0Foz9S9vUH0AVdhY"
   template_path: "./notifier_template.json"
