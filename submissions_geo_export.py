@@ -37,19 +37,30 @@ def _parse_timestamp(value):
         ) from exc
 
 
-def _database_connection():
-    required = ("PGDATABASE", "PGUSER", "PGPASSWORD")
-    missing = [name for name in required if not os.environ.get(name)]
+def _database_connection(database_config):
+    dbname = database_config["dbname"]
+    environment_dbname = os.environ.get("PGDATABASE")
+    if environment_dbname and environment_dbname != dbname:
+        raise RuntimeError(
+            f"PGDATABASE ({environment_dbname}) must match config.yaml database.dbname ({dbname})"
+        )
+
+    user = os.environ.get("PGUSER") or database_config.get("user")
+    password = os.environ.get("PGPASSWORD") or database_config.get("password")
+    missing = [
+        name for name, value in (("PGUSER", user), ("PGPASSWORD", password))
+        if not value
+    ]
     if missing:
         raise RuntimeError("Missing database environment variables: " + ", ".join(missing))
 
     return psycopg2.connect(
-        host=os.environ.get("PGHOST", "localhost"),
-        port=os.environ.get("PGPORT", "5432"),
-        dbname=os.environ["PGDATABASE"],
-        user=os.environ["PGUSER"],
-        password=os.environ["PGPASSWORD"],
-        connect_timeout=int(os.environ.get("PGCONNECT_TIMEOUT", "10")),
+        host=database_config["host"],
+        port=database_config["port"],
+        dbname=dbname,
+        user=user,
+        password=password,
+        connect_timeout=int(database_config.get("connect_timeout", 10)),
     )
 
 
@@ -61,6 +72,7 @@ def _load_source_config():
     tables = config["tables"]
     columns = config["pipeline"]["columns"]
     source_config = {
+        "database": config["database"],
         "submissions_table": tables["submissions"],
         "survey_table": tables["surveys"],
         "output_table": tables["anuga_output_table"],
@@ -376,7 +388,7 @@ def main():
         if not configured_webhook or configured_webhook == "REPLACE_WITH_YOUR_WEBHOOK_URL":
             raise RuntimeError("Set notifier.teams_webhook_url in config.yaml")
         webhook_url = configured_webhook
-        conn = _database_connection()
+        conn = _database_connection(source_config["database"])
         _ensure_output_table(conn, source_config["output_table"])
         row_count = _process_window(conn, args.start, args.end, source_config)
         conn.commit()

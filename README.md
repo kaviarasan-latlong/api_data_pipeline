@@ -350,11 +350,10 @@ The job creates and writes to `anuga_final` with these columns:
 - `pincode`
 - `server_created_at`
 
-Set the following environment variables before running it:
-
-- `PGDATABASE`, `PGUSER`, and `PGPASSWORD` (required)
-- `PGHOST` and `PGPORT` (optional; default to `localhost` and `5432`)
-- `PGCONNECT_TIMEOUT` (optional; defaults to `10` seconds)
+The exporter uses the same `database` connection settings as the API pipeline
+in `config.yaml`, so `anuga_final` is created in that same database. If the
+database `user` or `password` is blank there, provide the credentials through
+`PGUSER` and `PGPASSWORD`.
 
 Set `notifier.teams_webhook_url` in `config.yaml` to the Teams webhook URL.
 Both this standalone export and the API pipeline read the webhook from that
