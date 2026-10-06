@@ -98,31 +98,80 @@ def _compute_month_counts(conn, cfg, month_start, month_end):
             counts[name]["district"][(district, state)] += row_count
             counts[name]["state"][state] += row_count
 
-    return counts
+    anuga_counts = {sheet: Counter() for sheet in SHEET_NAMES}
+    anuga_table = cfg["tables"].get("anuga_output_table")
+    if anuga_table:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = %s
+                """,
+                (anuga_table,),
+            )
+            anuga_columns = {row[0] for row in cursor.fetchall()}
+
+        required_columns = {"pincode", "district", "state", "server_created_at"}
+        if required_columns.issubset(anuga_columns):
+            anuga_sql = f"""
+                SELECT {PINCODE_SQL} AS pincode, district, state, COUNT(*)
+                FROM {anuga_table}
+                WHERE server_created_at >= %s AND server_created_at < %s
+                  AND {valid_filter}
+                GROUP BY 1, 2, 3
+            """
+            with conn.cursor() as cursor:
+                cursor.execute(anuga_sql, (month_start, month_end))
+                for pincode, district, state, row_count in cursor.fetchall():
+                    anuga_counts["pincode"][(pincode, district, state)] += row_count
+                    anuga_counts["district"][(district, state)] += row_count
+                    anuga_counts["state"][state] += row_count
+
+    return counts, anuga_counts
 
 
-def _workbook_rows(sheet_name, counts):
+def _workbook_rows(sheet_name, counts, anuga_counts=None):
     if sheet_name == "pincode":
-        return ["pincode", "district", "state", "hit_count"], counts.items()
-    if sheet_name == "district":
-        return ["district", "state", "hit_count"], counts.items()
-    return ["state", "hit_count"], counts.items()
+        headers = ["pincode", "district", "state"]
+    elif sheet_name == "district":
+        headers = ["district", "state"]
+    else:
+        headers = ["state"]
+
+    if anuga_counts is None:
+        headers.append("hit_count")
+        entries = [
+            [*(key if isinstance(key, tuple) else (key,)), count]
+            for key, count in counts.items()
+        ]
+        entries.sort(key=lambda row: (-row[-1], tuple(str(value) for value in row[:-1])))
+    else:
+        headers.extend(["hit_count", "anuga"])
+        keys = set(counts) | set(anuga_counts)
+        entries = [
+            [*(key if isinstance(key, tuple) else (key,)),
+             counts.get(key, 0), anuga_counts.get(key, 0)]
+            for key in keys
+        ]
+        entries.sort(
+            key=lambda row: (-row[-2], -row[-1], tuple(str(value) for value in row[:-2]))
+        )
+    return headers, entries
 
 
-def _save_workbook(path, report_counts):
+def _save_workbook(path, report_counts, anuga_counts=None):
     workbook = Workbook()
     workbook.remove(workbook.active)
     for sheet_name in SHEET_NAMES:
         worksheet = workbook.create_sheet(title=sheet_name)
-        headers, entries = _workbook_rows(sheet_name, report_counts[sheet_name])
-        worksheet.append(headers)
-        sorted_entries = sorted(
-            entries,
-            key=lambda item: (-item[1], tuple(str(value) for value in item[0])
-                              if isinstance(item[0], tuple) else str(item[0])),
+        sheet_anuga_counts = anuga_counts[sheet_name] if anuga_counts is not None else None
+        headers, entries = _workbook_rows(
+            sheet_name, report_counts[sheet_name], sheet_anuga_counts
         )
-        for key, count in sorted_entries:
-            worksheet.append([*(key if isinstance(key, tuple) else (key,)), count])
+        worksheet.append(headers)
+        for entry in entries:
+            worksheet.append(entry)
 
     temporary_path = path.with_name(f".{path.stem}.tmp.xlsx")
     try:
@@ -171,10 +220,14 @@ def update_monthly_report_workbooks(conn, cfg, window_start, window_end):
     month_reports = {}
 
     for month_start, month_end in _months_in_window(window_start, window_end):
-        counts = _compute_month_counts(conn, cfg, month_start, month_end)
+        counts, anuga_counts = _compute_month_counts(conn, cfg, month_start, month_end)
         paths = _month_report_paths(cfg, month_start, report_names)
         for report_name, path in paths.items():
-            _save_workbook(path, counts[report_name])
+            _save_workbook(
+                path,
+                counts[report_name],
+                anuga_counts if report_name == "latlong" else None,
+            )
         month_key = month_start.strftime("%B_%Y").lower()
         month_reports[month_key] = {name: str(path) for name, path in paths.items()}
 

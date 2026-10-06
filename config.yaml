@@ -66,7 +66,7 @@ pipeline:
     submissions:
       content: "content"
       survey_id: "survey_id"
-      created_at: "created_at"
+      server_created_at: "server_created_at"
     surveys:
       id: "id"
       name: "name"
@@ -87,8 +87,9 @@ tables:
   request_logs: "logs_aug_2026"
   response_logs: "response_logs_aug_2026"
   session_activities: "session_activities_aug_26"
-  submissions: "submissions"
-  surveys: "surveys"
+  submissions: "submissions_aug_2026"
+  surveys: "surveys_aug_2026"
+  anuga_output_table: "anuga_final"
   watermark_table: "pipeline_watermark"
   output_table: "admin_area_enriched_final"
   geom_table: "aa_geom"
@@ -113,7 +114,7 @@ output:
       bunit_ids: [301, 540, 582, 273, 602, 370, 514, 577, 601, 406]
       tenant_ids: ["10002385"]
     bfsi:
-      bunit_ids: [379]
+      bunit_ids: [379,10792]
       tenant_ids: []
     others:
       bunit_ids: [251, 199, 302, 531]

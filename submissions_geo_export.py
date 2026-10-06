@@ -3,7 +3,8 @@
 
 Run with PGHOST, PGPORT, PGDATABASE, and PGPASSWORD set, then provide an
 ISO-8601 start and end window. The Teams webhook is read from config.yaml.
-The end timestamp is exclusive. This file is intentionally not wired into
+The end timestamp is exclusive and filters submissions.server_created_at.
+This file is intentionally not wired into
 the API data pipeline.
 """
 
@@ -22,7 +23,6 @@ from psycopg2.extras import execute_values
 
 
 LOGGER = logging.getLogger("submissions_geo_export")
-OUTPUT_TABLE = "anuga_final"
 COORDINATE_PATTERN = r"(-?\d{1,2}\.\d+),\s*(-?\d{1,3}\.\d+)"
 INSERT_BATCH_SIZE = 5000
 IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -63,6 +63,7 @@ def _load_source_config():
     source_config = {
         "submissions_table": tables["submissions"],
         "survey_table": tables["surveys"],
+        "output_table": tables["anuga_output_table"],
         "submission_columns": columns["submissions"],
         "survey_columns": columns["surveys"],
         "teams_webhook_url": config["notifier"]["teams_webhook_url"],
@@ -92,26 +93,32 @@ def _table_columns(conn, table_name):
         return {row[0] for row in cursor.fetchall()}
 
 
-def _ensure_output_table(conn):
+def _ensure_output_table(conn, output_table):
+    quoted_table = f'"{output_table}"'
     with conn.cursor() as cursor:
         cursor.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {OUTPUT_TABLE} (
+            f"""CREATE TABLE IF NOT EXISTS {quoted_table} (
                 name text,
                 bunit_id text,
                 latitude double precision,
                 longitude double precision,
                 state text,
                 district text,
-                pincode text
+                pincode text,
+                server_created_at timestamptz
             )
             """
         )
         cursor.execute(
-            f"""
-            CREATE UNIQUE INDEX IF NOT EXISTS {OUTPUT_TABLE}_row_uidx
-            ON {OUTPUT_TABLE}
-                (name, bunit_id, latitude, longitude, state, district, pincode)
+            f"ALTER TABLE {quoted_table} "
+            "ADD COLUMN IF NOT EXISTS server_created_at timestamptz"
+        )
+        cursor.execute(f"DROP INDEX IF EXISTS {output_table}_row_uidx")
+        cursor.execute(
+            f"""CREATE UNIQUE INDEX IF NOT EXISTS {output_table}_row_uidx
+            ON {quoted_table}
+                (name, bunit_id, latitude, longitude, state, district, pincode,
+                 server_created_at)
             """
         )
 
@@ -174,6 +181,7 @@ def _submission_query(geom_columns, area_columns, source_config):
         WITH extracted AS (
             SELECT
                 row_number() OVER () AS row_id,
+                s.{submission_columns['server_created_at']} AS server_created_at,
                 sv.{survey_columns['name']} AS name,
                 sv.{survey_columns['bunit_id']} AS bunit_id,
                 coordinate_match.parts[1]::double precision AS latitude,
@@ -184,8 +192,8 @@ def _submission_query(geom_columns, area_columns, source_config):
             CROSS JOIN LATERAL (
                                 SELECT regexp_match(s.{submission_columns['content']}::text, %s) AS parts
             ) coordinate_match
-                        WHERE s.{submission_columns['created_at']} >= %s
-                            AND s.{submission_columns['created_at']} < %s
+                        WHERE s.{submission_columns['server_created_at']} >= %s
+                            AND s.{submission_columns['server_created_at']} < %s
               AND coordinate_match.parts IS NOT NULL
         ),
         valid_points AS (
@@ -209,7 +217,7 @@ def _submission_query(geom_columns, area_columns, source_config):
         ),
         chain AS (
             SELECT
-                m.row_id, m.name, m.bunit_id, m.latitude, m.longitude,
+                m.row_id, m.server_created_at, m.name, m.bunit_id, m.latitude, m.longitude,
                 a.id AS current_id,
                 a.display_name,
                 a.aa_in_aa_id AS parent_id,
@@ -222,7 +230,7 @@ def _submission_query(geom_columns, area_columns, source_config):
             UNION ALL
 
             SELECT
-                c.row_id, c.name, c.bunit_id, c.latitude, c.longitude,
+                c.row_id, c.server_created_at, c.name, c.bunit_id, c.latitude, c.longitude,
                 a.id AS current_id,
                 a.display_name,
                 a.aa_in_aa_id AS parent_id,
@@ -234,22 +242,22 @@ def _submission_query(geom_columns, area_columns, source_config):
               AND c.parent_id IS NOT NULL
               {area_to_date_filter}
         )
-        SELECT row_id, name, bunit_id, latitude, longitude,
+        SELECT row_id, server_created_at, name, bunit_id, latitude, longitude,
                display_name, aa_order, depth
         FROM chain
         ORDER BY row_id, depth
     """
 
 
-def _write_batch(conn, rows):
+def _write_batch(conn, output_table, rows):
     if not rows:
         return
     with conn.cursor() as cursor:
         execute_values(
             cursor,
-            f"""
-            INSERT INTO {OUTPUT_TABLE}
-                (name, bunit_id, latitude, longitude, state, district, pincode)
+            f"""INSERT INTO "{output_table}"
+                (name, bunit_id, latitude, longitude, state, district, pincode,
+                 server_created_at)
             VALUES %s
             ON CONFLICT DO NOTHING
             """,
@@ -284,9 +292,9 @@ def _process_window(conn, start, end, source_config):
         if current_fields is None:
             return
         state, district, pincode = _resolve_hierarchy(hierarchy_rows)
-        pending.append((*current_fields, state, district, pincode))
+        pending.append((*current_fields[:4], state, district, pincode, current_fields[4]))
         if len(pending) >= INSERT_BATCH_SIZE:
-            _write_batch(conn, pending)
+            _write_batch(conn, source_config["output_table"], pending)
             inserted_rows += len(pending)
             pending.clear()
 
@@ -296,18 +304,23 @@ def _process_window(conn, start, end, source_config):
             if not batch:
                 break
             for row in batch:
-                row_id, name, bunit_id, latitude, longitude, display_name, aa_order, _depth = row
+                row_id, server_created_at, name, bunit_id, latitude, longitude, display_name, aa_order, _depth = row
                 if row_id != current_id:
                     flush_current()
                     current_id = row_id
-                    current_fields = (name, str(bunit_id) if bunit_id is not None else None,
-                                      latitude, longitude)
+                    current_fields = (
+                        name,
+                        str(bunit_id) if bunit_id is not None else None,
+                        latitude,
+                        longitude,
+                        server_created_at,
+                    )
                     hierarchy_rows = []
                 if display_name is not None:
                     hierarchy_rows.append((display_name, aa_order))
         flush_current()
         if pending:
-            _write_batch(conn, pending)
+            _write_batch(conn, source_config["output_table"], pending)
             inserted_rows += len(pending)
     finally:
         cursor.close()
@@ -347,9 +360,9 @@ def _send_teams_notification(webhook_url, title, details, failed=False):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--start", required=True, type=_parse_timestamp,
-                        help="Inclusive created_at window start (ISO-8601)")
+                        help="Inclusive server_created_at window start (ISO-8601)")
     parser.add_argument("--end", required=True, type=_parse_timestamp,
-                        help="Exclusive created_at window end (ISO-8601)")
+                        help="Exclusive server_created_at window end (ISO-8601)")
     args = parser.parse_args()
 
     if args.start >= args.end:
@@ -364,11 +377,11 @@ def main():
             raise RuntimeError("Set notifier.teams_webhook_url in config.yaml")
         webhook_url = configured_webhook
         conn = _database_connection()
-        _ensure_output_table(conn)
+        _ensure_output_table(conn, source_config["output_table"])
         row_count = _process_window(conn, args.start, args.end, source_config)
         conn.commit()
         details = (
-            f"Table: {OUTPUT_TABLE} | Window: {args.start.isoformat()} to "
+            f"Table: {source_config['output_table']} | Window: {args.start.isoformat()} to "
             f"{args.end.isoformat()} (end exclusive) | Rows processed: {row_count}"
         )
         _send_teams_notification(webhook_url, "Submissions geo export completed", details)
@@ -379,7 +392,8 @@ def main():
             conn.rollback()
         LOGGER.exception("Submissions geo export failed")
         details = (
-            f"Table: {OUTPUT_TABLE} | Window: {args.start.isoformat()} to "
+            f"Table: {source_config['output_table'] if 'source_config' in locals() else 'anuga_final'} | "
+            f"Window: {args.start.isoformat()} to "
             f"{args.end.isoformat()} (end exclusive) | Error: {exc}"
         )
         if webhook_url:

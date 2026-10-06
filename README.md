@@ -308,13 +308,17 @@ folders under the configured `output.report_dir`. Each folder contains four
 workbooks: `latlong`, `automobiles`, `bfsi`, and `others`. The full `latlong`
 workbook and each group workbook have `pincode`, `district`, and `state` sheets;
 the pincode sheet includes district and state, and the district sheet includes
-state. Counts are grouped by geographic hierarchy and filtered by the editable
-`output.report_groups` business-unit and tenant ID lists in `config.yaml`.
+state. The `latlong` workbook also has an `anuga` count column on all three
+sheets, populated from monthly rows in `anuga_final`. Submissions are not
+included in the `automobiles`, `bfsi`, or `others` workbooks. Those API counts
+are filtered by the editable `output.report_groups` business-unit and tenant ID
+lists in `config.yaml`.
 
-The output table stores each source row's `created_at` for monthly attribution.
-Rows written before this column is available have no recoverable processing
-month and are excluded from monthly reports. When a completed month has all
-four workbooks, the preceding month's report folder is removed.
+The API output table stores each source row's `created_at` for monthly
+attribution. The submissions export filters on `submissions.server_created_at`
+and persists it in `anuga_final` for monthly Anuga counts. Existing rows without
+the relevant timestamp cannot be assigned to a month. When a completed month
+has all four workbooks, the preceding month's report folder is removed.
 
 ---
 
@@ -328,7 +332,7 @@ The source tables are `submissions` and `surveys`. The job reads
 `submissions.content`, joins `submissions.survey_id` to `surveys.id`, and gets
 the name and `bunit_id` from `surveys`. It extracts the
 first decimal latitude/longitude pair from the content, filters submissions by
-`created_at`, and uses `aa_geom` and `admin_area` to look up state, district,
+`server_created_at`, and uses `aa_geom` and `admin_area` to look up state, district,
 and pincode. Rows without a valid coordinate pair are skipped.
 
 The source table names are configured under `tables` in `config.yaml`; their
@@ -344,6 +348,7 @@ The job creates and writes to `anuga_final` with these columns:
 - `state`
 - `district`
 - `pincode`
+- `server_created_at`
 
 Set the following environment variables before running it:
 
@@ -355,7 +360,7 @@ Set `notifier.teams_webhook_url` in `config.yaml` to the Teams webhook URL.
 Both this standalone export and the API pipeline read the webhook from that
 setting; `run_pipeline.sh` does not override it.
 
-Provide the start and end of the `created_at` window as ISO-8601 timestamps.
+Provide the start and end of the `server_created_at` window as ISO-8601 timestamps.
 The start is inclusive and the end is exclusive:
 
 ```bash
