@@ -21,6 +21,7 @@ import requests
 import yaml
 from psycopg2.extras import execute_values
 
+import geo_enrichment
 import metrics
 
 
@@ -122,19 +123,6 @@ def _latest_successful_pipeline_window(conn, source_config):
     return row
 
 
-def _table_columns(conn, table_name):
-    with conn.cursor() as cursor:
-        cursor.execute(
-            """
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_schema = 'public' AND table_name = %s
-            """,
-            (table_name,),
-        )
-        return {row[0] for row in cursor.fetchall()}
-
-
 def _ensure_output_table(conn, output_table):
     quoted_table = f'"{output_table}"'
     with conn.cursor() as cursor:
@@ -165,51 +153,7 @@ def _ensure_output_table(conn, output_table):
         )
 
 
-def _resolve_hierarchy(chain_rows):
-    pincode = None
-    district = None
-    state = None
-
-    for row in chain_rows:
-        display_name = str(row[0]).strip() if row[0] else ""
-        area_order = row[1]
-        pin_match = re.match(r"^\s*(\d{6})", display_name)
-
-        if pincode is None and (area_order == 55 or pin_match):
-            if pin_match:
-                pincode = pin_match.group(1)
-            if pincode is None:
-                continue
-            continue
-        if pincode is None:
-            continue
-        if area_order == 8 and district is None:
-            district = re.sub(r"^\d{6}\s*[-\u2013]?\s*", "", display_name).strip()
-            continue
-        if area_order == 9 and state is None:
-            state = re.sub(r"^\d{6}\s*[-\u2013]?\s*", "", display_name).strip()
-            break
-
-        if district is None and area_order is None:
-            district = re.sub(r"^\d{6}\s*[-\u2013]?\s*", "", display_name).strip()
-            continue
-        if district and state is None and area_order is None:
-            state = re.sub(r"^\d{6}\s*[-\u2013]?\s*", "", display_name).strip()
-            break
-
-    return state or None, district or None, pincode
-
-
-def _submission_query(geom_columns, area_columns, source_config):
-    geom_filters = []
-    if "to_date" in geom_columns:
-        geom_filters.append("g.to_date IS NULL")
-    if "aa_order" in geom_columns:
-        geom_filters.append("g.aa_order = 55")
-    geom_filter_sql = " AND ".join(geom_filters) if geom_filters else "TRUE"
-
-    area_order_select = "a.aa_order" if "aa_order" in area_columns else "NULL::integer"
-    area_to_date_filter = "AND a.to_date IS NULL" if "to_date" in area_columns else ""
+def _submission_query(source_config):
     submissions_table = f'"{source_config["submissions_table"]}"'
     survey_table = f'"{source_config["survey_table"]}"'
     submission_columns = {
@@ -220,74 +164,26 @@ def _submission_query(geom_columns, area_columns, source_config):
     }
 
     return f"""
-        WITH RECURSIVE extracted AS (
-            SELECT
-                row_number() OVER () AS row_id,
-                s.{submission_columns['server_created_at']} AS server_created_at,
-                sv.{survey_columns['name']} AS name,
-                sv.{survey_columns['bunit_id']} AS bunit_id,
-                coordinate_match.parts[1]::double precision AS latitude,
-                coordinate_match.parts[2]::double precision AS longitude
-                        FROM {submissions_table} s
-                        LEFT JOIN {survey_table} sv
-                            ON sv.{survey_columns['id']} = s.{submission_columns['survey_id']}
-            CROSS JOIN LATERAL (
-                                SELECT regexp_match(s.{submission_columns['content']}::text, %s) AS parts
-            ) coordinate_match
-                        WHERE s.{submission_columns['server_created_at']} >= %s
-                            AND s.{submission_columns['server_created_at']} < %s
-              AND coordinate_match.parts IS NOT NULL
-        ),
-        valid_points AS (
-            SELECT * FROM extracted
-            WHERE latitude BETWEEN -90 AND 90
-              AND longitude BETWEEN -180 AND 180
-        ),
-        matched AS (
-            SELECT p.*, geo.aa_id
-            FROM valid_points p
-            LEFT JOIN LATERAL (
-                SELECT g.aa_id
-                FROM aa_geom g
-                WHERE ST_Intersects(
-                    g.geom,
-                    ST_SetSRID(ST_MakePoint(p.longitude, p.latitude), 4326)
-                )
-                  AND {geom_filter_sql}
-                LIMIT 1
-            ) geo ON TRUE
-        ),
-        chain AS (
-            SELECT
-                m.row_id, m.server_created_at, m.name, m.bunit_id, m.latitude, m.longitude,
-                a.id AS current_id,
-                a.display_name,
-                a.aa_in_aa_id AS parent_id,
-                {area_order_select} AS aa_order,
-                1 AS depth
-            FROM matched m
-            LEFT JOIN admin_area a ON a.id = m.aa_id
-            {area_to_date_filter}
-
-            UNION ALL
-
-            SELECT
-                c.row_id, c.server_created_at, c.name, c.bunit_id, c.latitude, c.longitude,
-                a.id AS current_id,
-                a.display_name,
-                a.aa_in_aa_id AS parent_id,
-                {area_order_select} AS aa_order,
-                c.depth + 1 AS depth
-            FROM chain c
-            JOIN admin_area a ON a.id = c.parent_id
-            WHERE c.depth < 10
-              AND c.parent_id IS NOT NULL
-              {area_to_date_filter}
-        )
-        SELECT row_id, server_created_at, name, bunit_id, latitude, longitude,
-               display_name, aa_order, depth
-        FROM chain
-        ORDER BY row_id, depth
+        SELECT
+            row_number() OVER () AS row_id,
+            s.{submission_columns['server_created_at']} AS server_created_at,
+            s.{submission_columns['survey_id']} AS survey_id,
+            sv.{survey_columns['id']} IS NOT NULL AS survey_matched,
+            sv.{survey_columns['name']} AS name,
+            sv.{survey_columns['bunit_id']} AS bunit_id,
+            coordinate_match.parts[1]::double precision AS latitude,
+            coordinate_match.parts[2]::double precision AS longitude
+        FROM {submissions_table} s
+        LEFT JOIN {survey_table} sv
+          ON sv.{survey_columns['id']} = s.{submission_columns['survey_id']}
+        CROSS JOIN LATERAL (
+            SELECT regexp_match(s.{submission_columns['content']}::text, %s) AS parts
+        ) coordinate_match
+        WHERE s.{submission_columns['server_created_at']} >= %s
+          AND s.{submission_columns['server_created_at']} < %s
+          AND coordinate_match.parts IS NOT NULL
+          AND coordinate_match.parts[1]::double precision BETWEEN -90 AND 90
+          AND coordinate_match.parts[2]::double precision BETWEEN -180 AND 180
     """
 
 
@@ -309,63 +205,67 @@ def _write_batch(conn, output_table, rows):
 
 
 def _process_window(conn, start, end, source_config):
-    geom_columns = _table_columns(conn, "aa_geom")
-    area_columns = _table_columns(conn, "admin_area")
-    if not {"aa_id", "geom"}.issubset(geom_columns):
-        raise RuntimeError("aa_geom must contain aa_id and geom columns")
-    if not {"id", "aa_in_aa_id", "display_name"}.issubset(area_columns):
-        raise RuntimeError(
-            "admin_area must contain id, aa_in_aa_id, and display_name columns"
-        )
-
-    query = _submission_query(geom_columns, area_columns, source_config)
+    query = _submission_query(source_config)
     cursor = conn.cursor(name="submissions_geo_export_cursor")
     cursor.itersize = INSERT_BATCH_SIZE
     cursor.execute(query, (COORDINATE_PATTERN, start, end))
 
     inserted_rows = 0
-    pending = []
-    current_id = None
-    current_fields = None
-    hierarchy_rows = []
-
-    def flush_current():
-        nonlocal inserted_rows
-        if current_fields is None:
-            return
-        state, district, pincode = _resolve_hierarchy(hierarchy_rows)
-        pending.append((*current_fields[:4], state, district, pincode, current_fields[4]))
-        if len(pending) >= INSERT_BATCH_SIZE:
-            _write_batch(conn, source_config["output_table"], pending)
-            inserted_rows += len(pending)
-            pending.clear()
+    unmatched_survey_count = 0
+    unmatched_survey_ids = []
 
     try:
         while True:
             batch = cursor.fetchmany(INSERT_BATCH_SIZE)
             if not batch:
                 break
+            source_rows = []
             for row in batch:
-                row_id, server_created_at, name, bunit_id, latitude, longitude, display_name, aa_order, _depth = row
-                if row_id != current_id:
-                    flush_current()
-                    current_id = row_id
-                    current_fields = (
-                        name,
-                        str(bunit_id) if bunit_id is not None else None,
-                        latitude,
-                        longitude,
-                        server_created_at,
-                    )
-                    hierarchy_rows = []
-                if display_name is not None:
-                    hierarchy_rows.append((display_name, aa_order))
-        flush_current()
-        if pending:
+                _, server_created_at, survey_id, survey_matched, name, bunit_id, latitude, longitude = row
+                if not survey_matched:
+                    unmatched_survey_count += 1
+                    if len(unmatched_survey_ids) < 10:
+                        unmatched_survey_ids.append(survey_id)
+                source_rows.append({
+                    "server_created_at": server_created_at,
+                    "name": name,
+                    "bunit_id": str(bunit_id) if bunit_id is not None else None,
+                    "lat": latitude,
+                    "lng": longitude,
+                    "state": None,
+                    "district": None,
+                    "pincode": None,
+                    "address": None,
+                })
+
+            enriched_rows = geo_enrichment.enrich_rows(
+                conn, source_config["config"], source_rows,
+            )
+            pending = [
+                (
+                    row.get("name"),
+                    row.get("bunit_id"),
+                    row.get("lat"),
+                    row.get("lng"),
+                    row.get("state"),
+                    row.get("district"),
+                    row.get("pincode"),
+                    row.get("server_created_at"),
+                )
+                for row in enriched_rows
+            ]
             _write_batch(conn, source_config["output_table"], pending)
             inserted_rows += len(pending)
     finally:
         cursor.close()
+
+    if unmatched_survey_count:
+        LOGGER.warning(
+            "%d submissions had no matching survey row in %s; sample survey IDs: %s",
+            unmatched_survey_count,
+            source_config["survey_table"],
+            unmatched_survey_ids,
+        )
 
     return inserted_rows
 
