@@ -240,8 +240,9 @@ def _process_window(conn, start, end, source_config):
                     "address": None,
                 })
 
+            fallback_distance = float(source_config["config"].get("geo_enrichment", {}).get("fallback_distance_meters", 500))
             enriched_rows = geo_enrichment.enrich_rows(
-                conn, source_config["config"], source_rows,
+                conn, source_config["config"], source_rows, fallback_distance=fallback_distance,
             )
             pending = [
                 (
@@ -255,6 +256,7 @@ def _process_window(conn, start, end, source_config):
                     row.get("server_created_at"),
                 )
                 for row in enriched_rows
+                if row.get("pincode") and str(row.get("pincode")).strip()
             ]
             _write_batch(conn, source_config["output_table"], pending)
             inserted_rows += len(pending)

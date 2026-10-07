@@ -274,7 +274,8 @@ def run():
 
             # --- STAGE 3: Write (serialized for DB safety) ---
             t0 = time.monotonic()
-            writer.write_rows(conn, cfg, enriched_rows)
+            rows_to_write = [r for r in enriched_rows if r.get("pincode") and str(r.get("pincode")).strip()]
+            writer.write_rows(conn, cfg, rows_to_write)
             t_write = time.monotonic() - t0
 
             watermark.update_last_processed_id(

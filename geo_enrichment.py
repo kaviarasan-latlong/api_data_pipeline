@@ -212,7 +212,7 @@ def _resolve_admin_hierarchy_bulk(conn, cfg, area_ids: list):
 # Batch spatial lookup + hierarchy resolution
 # ---------------------------------------------------------------------------
 
-def _enrich_batch(conn, cfg, batch: list[dict]):
+def _enrich_batch(conn, cfg, batch: list[dict], fallback_distance: float = 0.0):
     tables = cfg["tables"]
     geo_cols = cfg["geo_enrichment"]["geom_table_columns"]
     area_cols = cfg["geo_enrichment"]["area_table_columns"]
@@ -223,9 +223,6 @@ def _enrich_batch(conn, cfg, batch: list[dict]):
     display_name_col = area_cols.get("display_name", "display_name")
     geom_col = geo_cols["geom"]
     geom_a_id_col = geo_cols["a_id"]
-    fallback_distance = float(cfg["geo_enrichment"].get("fallback_distance_meters", 1000))
-    if not 0 < fallback_distance <= 1000:
-        raise ValueError("geo_enrichment.fallback_distance_meters must be between 0 and 1000")
 
     # Cached schema checks — each of these hits the DB at most once
     geom_schema = _table_has_columns(conn, geom_table, ["to_date", "aa_order"])
@@ -242,62 +239,85 @@ def _enrich_batch(conn, cfg, batch: list[dict]):
         geom_where.append("g.aa_order = 55")
     geom_filter_sql = " AND ".join(geom_where) if geom_where else "TRUE"
     area_filter_sql = "AND a.to_date IS NULL" if area_schema.get("to_date", False) else ""
-    fallback_distance_sql = f"{fallback_distance:.3f}"
 
-    sql = f"""
-        WITH pts AS (
-                        SELECT idx, lat, lng,
-                                     ST_SetSRID(ST_MakePoint(lng, lat), 4326) AS geom
-                        FROM UNNEST(%s::int[], %s::float8[], %s::float8[])
-                                 AS t(idx, lat, lng)
-        )
-        SELECT pts.idx,
-                             COALESCE(exact_match.aa_id, nearby_match.aa_id) AS geom_aa_id,
-                             CASE
-                                     WHEN exact_match.aa_id IS NOT NULL THEN 'exact'
-                                     WHEN nearby_match.aa_id IS NOT NULL THEN 'within_1km'
-                                     ELSE NULL
-                             END AS match_type,
-               a.{area_id_col},
-               a.{display_name_col},
-               a.{parent_id_col}
-        FROM pts
-                LEFT JOIN LATERAL (
-                        SELECT g.{geom_a_id_col} AS aa_id
-                        FROM {geom_table} g
-                        WHERE ST_Intersects(g.{geom_col}, pts.geom)
-                            AND {geom_filter_sql}
-                        ORDER BY g.{geom_a_id_col}
-                        LIMIT 1
-                ) exact_match ON TRUE
-                LEFT JOIN LATERAL (
-                        SELECT g.{geom_a_id_col} AS aa_id
-                        FROM {geom_table} g
-                        WHERE exact_match.aa_id IS NULL
-                            AND {geom_filter_sql}
-                            AND g.{geom_col} && ST_MakeEnvelope(
-                                    ST_X(pts.geom) - {fallback_distance_sql} /
-                                            (111320.0 * GREATEST(ABS(COS(RADIANS(ST_Y(pts.geom)))), 0.01)),
-                                    ST_Y(pts.geom) - {fallback_distance_sql} / 110574.0,
-                                    ST_X(pts.geom) + {fallback_distance_sql} /
-                                            (111320.0 * GREATEST(ABS(COS(RADIANS(ST_Y(pts.geom)))), 0.01)),
-                                    ST_Y(pts.geom) + {fallback_distance_sql} / 110574.0,
-                                    4326
-                            )
-                            AND ST_DWithin(
-                                    g.{geom_col}::geography,
-                                    pts.geom::geography,
-                                    {fallback_distance_sql}
-                            )
-                        ORDER BY ST_Distance(g.{geom_col}::geography, pts.geom::geography),
-                                         g.{geom_a_id_col}
-                        LIMIT 1
-                ) nearby_match ON TRUE
-                LEFT JOIN {area_table} a
-                    ON a.{area_id_col} = COALESCE(exact_match.aa_id, nearby_match.aa_id)
-                    {area_filter_sql}
-        ORDER BY pts.idx
-    """
+    if fallback_distance and fallback_distance > 0:
+        fallback_distance_sql = f"{float(fallback_distance):.3f}"
+        sql = f"""
+            WITH pts AS (
+                SELECT idx, lat, lng,
+                       ST_SetSRID(ST_MakePoint(lng, lat), 4326) AS geom
+                FROM UNNEST(%s::int[], %s::float8[], %s::float8[])
+                         AS t(idx, lat, lng)
+            )
+            SELECT pts.idx,
+                   COALESCE(exact_match.aa_id, nearby_match.aa_id) AS geom_aa_id,
+                   CASE
+                       WHEN exact_match.aa_id IS NOT NULL THEN 'exact'
+                       WHEN nearby_match.aa_id IS NOT NULL THEN 'buffer'
+                       ELSE NULL
+                   END AS match_type,
+                   a.{area_id_col},
+                   a.{display_name_col},
+                   a.{parent_id_col}
+            FROM pts
+            LEFT JOIN LATERAL (
+                SELECT g.{geom_a_id_col} AS aa_id
+                FROM {geom_table} g
+                WHERE ST_Intersects(g.{geom_col}, pts.geom)
+                    AND {geom_filter_sql}
+                ORDER BY g.{geom_a_id_col}
+                LIMIT 1
+            ) exact_match ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT g.{geom_a_id_col} AS aa_id
+                FROM {geom_table} g
+                WHERE exact_match.aa_id IS NULL
+                    AND {geom_filter_sql}
+                    AND g.{geom_col} && ST_Buffer(pts.geom::geography, {fallback_distance_sql})::geometry
+                    AND ST_Intersects(
+                        g.{geom_col},
+                        ST_Buffer(pts.geom::geography, {fallback_distance_sql})::geometry
+                    )
+                ORDER BY ST_Distance(g.{geom_col}::geography, pts.geom::geography),
+                         g.{geom_a_id_col}
+                LIMIT 1
+            ) nearby_match ON TRUE
+            LEFT JOIN {area_table} a
+                ON a.{area_id_col} = COALESCE(exact_match.aa_id, nearby_match.aa_id)
+                {area_filter_sql}
+            ORDER BY pts.idx
+        """
+    else:
+        sql = f"""
+            WITH pts AS (
+                SELECT idx, lat, lng,
+                       ST_SetSRID(ST_MakePoint(lng, lat), 4326) AS geom
+                FROM UNNEST(%s::int[], %s::float8[], %s::float8[])
+                         AS t(idx, lat, lng)
+            )
+            SELECT pts.idx,
+                   exact_match.aa_id AS geom_aa_id,
+                   CASE
+                       WHEN exact_match.aa_id IS NOT NULL THEN 'exact'
+                       ELSE NULL
+                   END AS match_type,
+                   a.{area_id_col},
+                   a.{display_name_col},
+                   a.{parent_id_col}
+            FROM pts
+            LEFT JOIN LATERAL (
+                SELECT g.{geom_a_id_col} AS aa_id
+                FROM {geom_table} g
+                WHERE ST_Intersects(g.{geom_col}, pts.geom)
+                    AND {geom_filter_sql}
+                ORDER BY g.{geom_a_id_col}
+                LIMIT 1
+            ) exact_match ON TRUE
+            LEFT JOIN {area_table} a
+                ON a.{area_id_col} = exact_match.aa_id
+                {area_filter_sql}
+            ORDER BY pts.idx
+        """
     with conn.cursor() as cur:
         cur.execute(sql, (idxs, lats, lngs))
         results = cur.fetchall()
@@ -309,12 +329,12 @@ def _enrich_batch(conn, cfg, batch: list[dict]):
         idx = row[0]
         if idx not in by_idx:
             by_idx[idx] = row[1]
-        if row[2] == "within_1km":
+        if row[2] == "buffer":
             fallback_matches += 1
 
     if fallback_matches:
         logger.info(
-            "Geo lookup used the nearest pincode area within %.0f m for %d/%d coordinates.",
+            "Geo lookup used the nearest pincode area within %.0f m buffer for %d/%d coordinates.",
             fallback_distance,
             fallback_matches,
             len(batch),
@@ -340,7 +360,7 @@ def _enrich_batch(conn, cfg, batch: list[dict]):
     return resolved
 
 
-def enrich_rows(conn, cfg, rows: list[dict]):
+def enrich_rows(conn, cfg, rows: list[dict], fallback_distance: float = 0.0):
     for row in rows:
         _normalize_source_geo_fields(row)
 
@@ -353,7 +373,7 @@ def enrich_rows(conn, cfg, rows: list[dict]):
     for start in range(0, len(to_enrich_idx), batch_size):
         idx_slice = to_enrich_idx[start:start + batch_size]
         batch = [rows[i] for i in idx_slice]
-        results = _enrich_batch(conn, cfg, batch)
+        results = _enrich_batch(conn, cfg, batch, fallback_distance=fallback_distance)
 
         for local_idx, global_idx in enumerate(idx_slice):
             geo = results.get(local_idx)
