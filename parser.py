@@ -29,6 +29,7 @@ Returns kept rows plus a counts dict: dropped_error, dropped_no_latlong, kept.
 
 import json
 import logging
+import math
 import re
 from urllib.parse import urlparse, parse_qs
 
@@ -46,6 +47,7 @@ FIELD_KEY_RE = {
 }
 
 FAILURE_VALUES = {"failure", "failed", "error", "err"}
+COORDINATE_PAIR_PARAM_KEYS = ("origins", "origin", "source", "path")
 INVALID_GEO_VALUES = {"", "yes", "no", "true", "false", "null", "none", "n/a", "na"}
 PINCODE_VALUE_RE = re.compile(r"^\s*(\d{6})(?:\s*[-–]\s*.*)?\s*$")
 
@@ -69,6 +71,17 @@ def _as_float(v):
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+def _valid_latlong(value):
+    if value is None:
+        return None
+    latitude, longitude = value
+    if not (math.isfinite(latitude) and math.isfinite(longitude)):
+        return None
+    if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
+        return None
+    return latitude, longitude
 
 
 def _extract_point_latlng(value):
@@ -101,15 +114,31 @@ def _extract_first_coordinate_pair(value):
 
 
 def _extract_first_origin_or_first_pair(params):
-    for key in ["origins", "origin", "source", "path"]:
+    for key in COORDINATE_PAIR_PARAM_KEYS:
         if key in params:
             pair = _extract_first_coordinate_pair(params[key])
+            pair = _valid_latlong(pair)
             if pair is not None:
                 return pair
-    for value in params.values():
-        pair = _extract_first_coordinate_pair(value)
-        if pair is not None:
-            return pair
+    return None
+
+
+def _extract_directions_origin(path):
+    if not path:
+        return None
+    try:
+        parsed = urlparse(path)
+        if not parsed.path.rstrip("/").lower().endswith("/directions.json"):
+            return None
+        params = parse_qs(parsed.query)
+    except Exception:
+        return None
+
+    for key in ("origin", "origins"):
+        for value in params.get(key, []):
+            point = _valid_latlong(_extract_first_coordinate_pair(value))
+            if point is not None:
+                return point
     return None
 
 
@@ -130,7 +159,9 @@ def _find_latlong_in_obj(obj):
                     if point is not None and lat is None and lng is None:
                         return point
         if lat is not None and lng is not None:
-            return (lat, lng)
+            point = _valid_latlong((lat, lng))
+            if point is not None:
+                return point
         for v in obj.values():
             found = _find_latlong_in_obj(v)
             if found:
@@ -141,7 +172,9 @@ def _find_latlong_in_obj(obj):
                 lat = _as_float(item[0])
                 lng = _as_float(item[1])
                 if lat is not None and lng is not None:
-                    return (lat, lng)
+                    point = _valid_latlong((lat, lng))
+                    if point is not None:
+                        return point
             found = _find_latlong_in_obj(item)
             if found:
                 return found
@@ -190,7 +223,7 @@ def _extract_from_path(path: str):
         if pair is not None:
             lat, lng = pair
 
-    latlong = (lat, lng) if lat is not None and lng is not None else None
+    latlong = _valid_latlong((lat, lng)) if lat is not None and lng is not None else None
     fields = _find_fields_in_obj(params)
     return latlong, fields
 
@@ -203,7 +236,7 @@ def _extract_from_response(data):
             data = json.loads(data)
         except (json.JSONDecodeError, TypeError):
             return None, {}
-    latlong = _find_latlong_in_obj(data)
+    latlong = _valid_latlong(_find_latlong_in_obj(data))
     fields = _find_fields_in_obj(data)
     return latlong, fields
 
@@ -246,8 +279,15 @@ def parse_rows(rows: list[dict]):
         session_lng = row.get("lng")
         if session_lat is not None and session_lng is not None:
             final_latlong = (float(session_lat), float(session_lng))
+        elif str(row.get("api_type") or "").lower().endswith("/directions.json"):
+            final_latlong = (
+                _extract_directions_origin(request_path)
+                or request_latlong
+                or response_latlong
+            )
         else:
             final_latlong = response_latlong or request_latlong
+        final_latlong = _valid_latlong(final_latlong)
 
         if final_latlong is None:
             if is_error:
