@@ -146,6 +146,8 @@ def _fetch_session_activity_chunk(conn, cfg, window_start, window_end):
         row_id, session_id, api_type, path, query_string, lat, lng, created_at, status = row
         if lat is None or lng is None:
             continue
+        if float(lat) == 0.0 or float(lng) == 0.0:
+            continue
         result.append({
             "id": row_id,
             "session_id": session_id,

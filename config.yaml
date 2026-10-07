@@ -96,7 +96,7 @@ tables:
   area_table: "admin_area"
 
 geo_enrichment:
-  fallback_distance_meters: 1000
+  fallback_distance_meters: 500
   geom_table_columns:
     a_id: "aa_id"
     geom: "geom"

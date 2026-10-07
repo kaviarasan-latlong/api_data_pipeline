@@ -184,6 +184,8 @@ def _submission_query(source_config):
           AND coordinate_match.parts IS NOT NULL
           AND coordinate_match.parts[1]::double precision BETWEEN -90 AND 90
           AND coordinate_match.parts[2]::double precision BETWEEN -180 AND 180
+          AND coordinate_match.parts[1]::double precision <> 0
+          AND coordinate_match.parts[2]::double precision <> 0
     """
 
 

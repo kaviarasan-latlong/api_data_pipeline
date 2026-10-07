@@ -81,6 +81,9 @@ def _valid_latlong(value):
         return None
     if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
         return None
+    # Reject zero lat/long — (0,0) is Gulf of Guinea, not valid for India
+    if latitude == 0.0 or longitude == 0.0:
+        return None
     return latitude, longitude
 
 
