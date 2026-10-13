@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Entry point called by the Airflow DAG (data_dag.py).
+# Entry point managed by PM2 (ecosystem.config.cjs → cron_restart).
 # Activates the pipeline's Python environment and runs main.py, which
 # sequentially executes the API logs pipeline and the submissions
 # geo-enrichment, then sends a single unified Teams notification.
