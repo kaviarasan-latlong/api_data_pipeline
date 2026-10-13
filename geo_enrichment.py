@@ -175,10 +175,7 @@ def _resolve_admin_hierarchy_bulk(conn, cfg, area_ids: list):
             parsed = _parse_pincode(name)
 
             if pincode is None and ((area_order == 55) or parsed):
-                if parsed:
-                    pincode = parsed
-                elif area_order == 55:
-                    pincode = _parse_pincode(name)
+                pincode = parsed or _parse_pincode(name) or (re.search(r"\b(\d{6})\b", name).group(1) if re.search(r"\b(\d{6})\b", name) else None)
                 continue
             if pincode is None:
                 continue
@@ -237,7 +234,7 @@ def _enrich_batch(conn, cfg, batch: list[dict], fallback_distance: float = 0.0):
         geom_where.append("g.to_date IS NULL")
     if geom_schema.get("aa_order", False):
         geom_where.append("g.aa_order = 55")
-    geom_filter_sql = " AND ".join(geom_where) if geom_where else "TRUE"
+    geom_filter_sql = " AND ".join(geom_where) if geom_where else "g.to_date IS NULL"
     area_filter_sql = "AND a.to_date IS NULL" if area_schema.get("to_date", False) else ""
 
     if fallback_distance and fallback_distance > 0:
@@ -360,13 +357,16 @@ def _enrich_batch(conn, cfg, batch: list[dict], fallback_distance: float = 0.0):
     return resolved
 
 
-def enrich_rows(conn, cfg, rows: list[dict], fallback_distance: float = 0.0):
+def enrich_rows(conn, cfg, rows: list[dict], fallback_distance: float = None):
     for row in rows:
         _normalize_source_geo_fields(row)
 
     to_enrich_idx = [i for i, r in enumerate(rows) if _needs_enrichment(r)]
     if not to_enrich_idx:
         return rows
+
+    if fallback_distance is None:
+        fallback_distance = float(cfg.get("geo_enrichment", {}).get("fallback_distance_meters", 500))
 
     batch_size = cfg["geo_enrichment"].get("batch_size", 5000)
 
