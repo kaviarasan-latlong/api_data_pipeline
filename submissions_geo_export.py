@@ -14,15 +14,14 @@ import re
 import sys
 import time
 from datetime import datetime
-from pathlib import Path
 
 import psycopg2
 import requests
-import yaml
 from psycopg2.extras import execute_values
 
 import geo_enrichment
 import metrics
+import config_loader
 
 
 LOGGER = logging.getLogger("submissions_geo_export")
@@ -74,11 +73,7 @@ def _database_connection(database_config):
     return psycopg2.connect(**connection_options)
 
 
-def _load_source_config():
-    config_path = Path(__file__).with_name("config.yaml")
-    with config_path.open(encoding="utf-8") as config_file:
-        config = yaml.safe_load(config_file)
-
+def _build_source_config(config):
     tables = config["tables"]
     columns = config["pipeline"]["columns"]
     source_config = {
@@ -105,6 +100,11 @@ def _load_source_config():
     return source_config
 
 
+def _load_source_config():
+    config = config_loader.load_config()
+    return _build_source_config(config)
+
+
 def _latest_successful_pipeline_window(conn, source_config):
     with conn.cursor() as cursor:
         cursor.execute(
@@ -123,7 +123,7 @@ def _latest_successful_pipeline_window(conn, source_config):
     return row
 
 
-def _ensure_output_table(conn, output_table):
+def ensure_output_table(conn, output_table):
     quoted_table = f'"{output_table}"'
     with conn.cursor() as cursor:
         cursor.execute(
@@ -151,6 +151,10 @@ def _ensure_output_table(conn, output_table):
                  server_created_at)
             """
         )
+    conn.commit()
+
+
+_ensure_output_table = ensure_output_table
 
 
 def _submission_query(source_config):
@@ -314,7 +318,29 @@ def _send_teams_notification(webhook_url, title, details, failed=False):
         raise RuntimeError(f"Teams notification failed with HTTP {response.status_code}")
 
 
+def export_submissions(conn, cfg, window_start, window_end):
+    """Run the submissions geo-enrichment pipeline for the given window.
+
+    This is the public entry point used by main.py so both the API pipeline
+    and the submissions export share a single process and a single DB
+    connection.  The caller (main.py) commits and closes the connection; this
+    function only commits the Anuga rows after each batch.
+
+    Returns the number of rows written (or already present) in anuga_final.
+    """
+    source_config = _build_source_config(cfg)
+    ensure_output_table(conn, source_config["output_table"])
+    row_count = _process_window(conn, window_start, window_end, source_config)
+    conn.commit()
+    LOGGER.info(
+        "Submissions export: %d rows written for window %s -> %s",
+        row_count, window_start, window_end,
+    )
+    return row_count
+
+
 def main():
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--from-watermark", action="store_true",
                         help="Use the latest successful API pipeline window")

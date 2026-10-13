@@ -84,11 +84,11 @@ pipeline:
       - "data.geometry.location.lng"
 
 tables:
-  request_logs: "logs_aug_2026"
-  response_logs: "response_logs_aug_2026"
-  session_activities: "session_activities_aug_26"
-  submissions: "submissions_aug_2026"
-  surveys: "surveys_aug_2026"
+  request_logs: "rd.logs"
+  response_logs: "rd.response_logs"
+  session_activities: "rd.session_activities"
+  submissions: "rd2.submissions"
+  surveys: "rd2.surveys"
   anuga_output_table: "anuga_final"
   watermark_table: "pipeline_watermark"
   output_table: "admin_area_enriched_final"

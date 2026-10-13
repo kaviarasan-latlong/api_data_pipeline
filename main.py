@@ -3,15 +3,23 @@ main.py
 
 Entry point invoked by run_pipeline.sh (in turn triggered by data_dag.py).
 
+Stage 1 — API logs pipeline:
     determine window (watermark.py)
       -> for each chunk (extractor.py):
             parse (parser.py)         [parallel via multiprocessing]
             geo-enrich (geo_enrichment.py) [parallel via thread pool + connection pool]
             write (writer.py)
             advance watermark (watermark.py)
-      -> on window exhaustion: mark SUCCESS, build report (metrics.py),
-         notify (notifier.py)
-      -> on any exception: mark FAILED, re-raise (Airflow surfaces the failure)
+
+Stage 2 — Submissions geo-enrichment (runs sequentially after Stage 1):
+    submissions_geo_export.export_submissions()
+      -> reads submissions table, enriches lat/lng, writes to anuga_final
+
+After both stages complete:
+    - mark window SUCCESS in watermark table
+    - refresh monthly Excel reports (metrics.py) — captures both API and Anuga counts
+    - send single unified Teams notification (notifier.py)
+    - on any exception: mark window FAILED, send failure notification, re-raise
 
 OPTIMIZATIONS (v2):
   - Connection pool (ThreadedConnectionPool) replaces per-worker connect/close
@@ -39,6 +47,7 @@ import notifier
 import parser
 import watermark
 import writer
+import submissions_geo_export
 
 logging.basicConfig(
     level=logging.INFO,
@@ -302,10 +311,21 @@ def run():
         if all_no_latlong_ids:
             _write_error_ids_file(os.path.join(error_dir, "no_latlong_error_ids.txt"), all_no_latlong_ids)
 
+        api_elapsed = time.monotonic() - pipeline_start
+        logger.info("API logs stage complete in %.1fs. Totals: %s", api_elapsed, totals)
+
+        # --- STAGE: Submissions geo-enrichment (sequential, same connection) ---
+        current_stage = "submissions geo-enrichment"
+        logger.info("Starting submissions geo-enrichment for window %s -> %s", window_start, window_end)
+        anuga_row_count = submissions_geo_export.export_submissions(conn, cfg, window_start, window_end)
+        logger.info("Submissions geo-enrichment complete: %d rows written.", anuga_row_count)
+
+        # --- Mark window SUCCESS only after both stages finish ---
         watermark.mark_window_status(conn, watermark_table, pipeline_name, window_start, "SUCCESS")
         pipeline_elapsed = time.monotonic() - pipeline_start
-        logger.info("Window complete in %.1fs. Totals: %s", pipeline_elapsed, totals)
+        logger.info("Full pipeline (API + Submissions) complete in %.1fs.", pipeline_elapsed)
 
+        # --- Refresh monthly reports once (captures both API and Anuga rows) ---
         monthly_reports = metrics.update_monthly_report_workbooks(
             conn, cfg, window_start, window_end,
         )
@@ -314,18 +334,19 @@ def run():
         run_summary = metrics.build_run_summary(pipeline_name, window_start, window_end, totals, report_path)
         run_summary["output_table"] = output_table
         run_summary["report_paths"] = monthly_reports
-        run_summary["duration_seconds"] = round(time.monotonic() - pipeline_start, 1)
-        run_summary["table_details"] = f"API output table: {output_table}"
-        if os.environ.get("PIPELINE_DEFER_SUCCESS_NOTIFICATION") == "1":
-            logger.info("API success notification deferred until Anuga export completes.")
-        else:
-            try:
-                notifier.send_notification(cfg, run_summary)
-            except Exception as notification_error:
-                logger.error(
-                    "Processing and reports succeeded, but Teams notification failed: %s",
-                    notification_error,
-                )
+        run_summary["duration_seconds"] = round(pipeline_elapsed, 1)
+        run_summary["table_details"] = (
+            f"API table: {output_table} | "
+            f"Anuga table: {cfg['tables'].get('anuga_output_table', 'n/a')} | "
+            f"Anuga rows: {anuga_row_count}"
+        )
+        try:
+            notifier.send_notification(cfg, run_summary)
+        except Exception as notification_error:
+            logger.error(
+                "Pipeline succeeded, but Teams notification failed: %s",
+                notification_error,
+            )
 
     except Exception as exc:
         logger.exception("Pipeline run failed - marking window FAILED for retry/resume.")
@@ -335,6 +356,7 @@ def run():
         except Exception:
             pass
 
+        failed_stage = locals().get("current_stage", "API logs processing")
         failure_summary = {
             "pipeline_name": pipeline_name,
             "window_start": str(locals().get("window_start", "n/a")),
@@ -344,11 +366,7 @@ def run():
             "dropped_no_latlong": 0,
             "report_path": "n/a",
             "output_table": output_table,
-            "failure_message": (
-                f"API stage failed: {exc}. Anuga export was not run."
-                if os.environ.get("PIPELINE_DEFER_SUCCESS_NOTIFICATION") == "1"
-                else str(exc)
-            ),
+            "failure_message": f"Stage '{failed_stage}' failed: {exc}",
             "duration_seconds": round(time.monotonic() - pipeline_start, 1),
             "table_details": (
                 f"API output table: {output_table}; "

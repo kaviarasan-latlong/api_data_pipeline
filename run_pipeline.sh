@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Entry point called by the Airflow DAG (data_dag.py).
-# Activates the pipeline's Python environment, runs one API window, then
-# exports Anuga submissions for that successful window.
+# Activates the pipeline's Python environment and runs main.py, which
+# sequentially executes the API logs pipeline and the submissions
+# geo-enrichment, then sends a single unified Teams notification.
 
 set -euo pipefail
 
@@ -28,7 +29,4 @@ else
 fi
 
 cd "$PIPELINE_DIR"
-export PIPELINE_RUN_STARTED_AT="$(date +%s)"
-export PIPELINE_DEFER_SUCCESS_NOTIFICATION=1
 "$PYTHON_BIN" main.py
-"$PYTHON_BIN" submissions_geo_export.py --from-watermark
