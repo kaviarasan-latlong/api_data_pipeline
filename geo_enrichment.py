@@ -85,6 +85,140 @@ def _normalize_source_geo_fields(row):
 
 
 # ---------------------------------------------------------------------------
+# Resolve district/state directly by pincode value (no spatial lookup needed)
+# ---------------------------------------------------------------------------
+
+def _resolve_hierarchy_by_pincode_bulk(conn, cfg, pincodes: list):
+    """
+    For rows that already have a pincode (from API response) but are missing
+    district/state, look up admin_area directly by display_name matching the
+    pincode value and walk the parent chain.
+
+    This avoids a spatial lat/lng lookup which may match a DIFFERENT polygon
+    than the pincode that the API already returned.
+
+    Returns {pincode_str: {"pincode": ..., "district": ..., "state": ...}}
+    """
+    if not pincodes:
+        return {}
+
+    area_cols = cfg["geo_enrichment"]["area_table_columns"]
+    parent_col = area_cols.get("parent_id", "aa_in_aa_id")
+    display_col = area_cols.get("display_name", "display_name")
+    a_id_col = area_cols.get("a_id", "id")
+    area_table = cfg["tables"]["area_table"]
+    geom_table = cfg["tables"]["geom_table"]
+
+    schema_info = _table_has_columns(conn, area_table, ["aa_order", "to_date"])
+    has_aa_order = schema_info.get("aa_order", False)
+    has_to_date = schema_info.get("to_date", False)
+    geom_schema = _table_has_columns(conn, geom_table, ["to_date"])
+
+    aa_order_select = ", a.aa_order" if has_aa_order else ", NULL::int AS aa_order"
+    area_to_date_filter = "AND a.to_date IS NULL" if has_to_date else ""
+    geom_to_date_filter = "AND g.to_date IS NULL" if geom_schema.get("to_date", False) else ""
+
+    unique_pincodes = list(set(pincodes))
+
+    # Build patterns like '^\\s*210205(\\s*[-–]|$)' for each pincode
+    sql = f"""
+        WITH RECURSIVE start_nodes AS (
+            SELECT DISTINCT ON (matched_pincode)
+                matched_pincode,
+                a.{a_id_col} AS start_id,
+                a.{display_col} AS display_name,
+                a.{parent_col} AS parent_id
+                {aa_order_select}
+            FROM (
+                SELECT UNNEST(%s::text[]) AS matched_pincode
+            ) pincodes
+            JOIN {area_table} a
+                ON a.{display_col} ~ ('^\\s*' || pincodes.matched_pincode || '(\\s*[-–]|$)')
+            JOIN {geom_table} g ON g.aa_id = a.{a_id_col} {geom_to_date_filter}
+            WHERE True
+            {area_to_date_filter}
+            ORDER BY matched_pincode, a.{a_id_col}
+        ),
+        chain AS (
+            SELECT
+                s.matched_pincode AS pincode_key,
+                s.start_id,
+                s.start_id AS current_id,
+                s.display_name,
+                s.parent_id
+                {aa_order_select.replace('a.aa_order', 's.aa_order').replace(', NULL::int AS aa_order', ', NULL::int AS aa_order')},
+                1 AS depth
+            FROM start_nodes s
+
+            UNION ALL
+
+            SELECT
+                c.pincode_key,
+                c.start_id,
+                a.{a_id_col} AS current_id,
+                a.{display_col} AS display_name,
+                a.{parent_col} AS parent_id
+                {aa_order_select},
+                c.depth + 1
+            FROM chain c
+            JOIN {area_table} a ON a.{a_id_col} = c.parent_id
+            WHERE c.depth < 10
+              AND c.parent_id IS NOT NULL
+              {area_to_date_filter}
+        )
+        SELECT pincode_key, current_id, display_name, parent_id, aa_order, depth
+        FROM chain
+        ORDER BY pincode_key, depth
+    """
+
+    with conn.cursor() as cur:
+        cur.execute(sql, (unique_pincodes,))
+        rows = cur.fetchall()
+
+    # Group by pincode_key
+    chains: dict[str, list] = {}
+    for row in rows:
+        pk = row[0]
+        if pk not in chains:
+            chains[pk] = []
+        chains[pk].append(row)
+
+    results = {}
+    for pincode_key, chain_rows in chains.items():
+        pincode = pincode_key
+        district = None
+        state = None
+
+        for row in chain_rows:
+            # row: (pincode_key, current_id, display_name, parent_id, aa_order, depth)
+            name = str(row[2]).strip() if row[2] else ""
+            area_order = row[4]
+
+            if area_order == 55:
+                continue  # This is the pincode node itself, skip
+            if area_order == 8 and district is None:
+                district = _clean_area_name(name)
+                continue
+            if area_order == 9 and state is None:
+                state = _clean_area_name(name)
+                break
+            if district is None and name and area_order is None:
+                district = _clean_area_name(name)
+                continue
+            if district and state is None and area_order is None:
+                state = _clean_area_name(name)
+                break
+
+        results[pincode_key] = {
+            "pincode": pincode,
+            "district": district,
+            "state": state,
+        }
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Bulk admin hierarchy resolution via recursive CTE
 # ---------------------------------------------------------------------------
 
@@ -127,6 +261,7 @@ def _resolve_admin_hierarchy_bulk(conn, cfg, area_ids: list):
                 1 AS depth
             FROM {area_table} a
             WHERE a.{a_id_col} = ANY(%s)
+              AND a.aa_order = 55
             {to_date_filter}
 
             UNION ALL
@@ -260,16 +395,22 @@ def _enrich_batch(conn, cfg, batch: list[dict], fallback_distance: float = 0.0):
             LEFT JOIN LATERAL (
                 SELECT g.{geom_a_id_col} AS aa_id
                 FROM {geom_table} g
+                JOIN {area_table} sub_a ON sub_a.{area_id_col} = g.{geom_a_id_col}
                 WHERE ST_Intersects(g.{geom_col}, pts.geom)
                     AND {geom_filter_sql}
+                    AND sub_a.aa_order = 55
+                    {area_filter_sql.replace('a.', 'sub_a.')}
                 ORDER BY g.{geom_a_id_col}
                 LIMIT 1
             ) exact_match ON TRUE
             LEFT JOIN LATERAL (
                 SELECT g.{geom_a_id_col} AS aa_id
                 FROM {geom_table} g
+                JOIN {area_table} sub_a ON sub_a.{area_id_col} = g.{geom_a_id_col}
                 WHERE exact_match.aa_id IS NULL
                     AND {geom_filter_sql}
+                    AND sub_a.aa_order = 55
+                    {area_filter_sql.replace('a.', 'sub_a.')}
                     AND g.{geom_col} && ST_Buffer(pts.geom::geography, {fallback_distance_sql})::geometry
                     AND ST_Intersects(
                         g.{geom_col},
@@ -305,8 +446,11 @@ def _enrich_batch(conn, cfg, batch: list[dict], fallback_distance: float = 0.0):
             LEFT JOIN LATERAL (
                 SELECT g.{geom_a_id_col} AS aa_id
                 FROM {geom_table} g
+                JOIN {area_table} sub_a ON sub_a.{area_id_col} = g.{geom_a_id_col}
                 WHERE ST_Intersects(g.{geom_col}, pts.geom)
                     AND {geom_filter_sql}
+                    AND sub_a.aa_order = 55
+                    {area_filter_sql.replace('a.', 'sub_a.')}
                 ORDER BY g.{geom_a_id_col}
                 LIMIT 1
             ) exact_match ON TRUE
@@ -370,19 +514,51 @@ def enrich_rows(conn, cfg, rows: list[dict], fallback_distance: float = None):
 
     batch_size = cfg["geo_enrichment"].get("batch_size", 5000)
 
-    for start in range(0, len(to_enrich_idx), batch_size):
-        idx_slice = to_enrich_idx[start:start + batch_size]
-        batch = [rows[i] for i in idx_slice]
-        results = _enrich_batch(conn, cfg, batch, fallback_distance=fallback_distance)
+    # --- Split into two groups ---
+    # Group A: already has pincode but missing district/state
+    #   → resolve directly from admin_area by pincode (no spatial lat/lng lookup)
+    # Group B: missing pincode entirely
+    #   → do full spatial lat/lng lookup via aa_geom
+    pincode_only_idx = [
+        i for i in to_enrich_idx
+        if rows[i].get("pincode") and not (rows[i].get("district") and rows[i].get("state"))
+    ]
+    spatial_lookup_idx = [
+        i for i in to_enrich_idx
+        if not rows[i].get("pincode")
+    ]
 
-        for local_idx, global_idx in enumerate(idx_slice):
-            geo = results.get(local_idx)
-            if not geo:
-                continue
+    # --- Group A: Resolve district/state by pincode directly ---
+    if pincode_only_idx:
+        unique_pincodes = list({rows[i]["pincode"] for i in pincode_only_idx})
+        pincode_hierarchy = _resolve_hierarchy_by_pincode_bulk(conn, cfg, unique_pincodes)
+        for global_idx in pincode_only_idx:
             row = rows[global_idx]
-            row["pincode"] = row.get("pincode") or geo.get("pincode")
+            pc = row.get("pincode")
+            geo = pincode_hierarchy.get(pc, {})
             row["district"] = row.get("district") or geo.get("district")
             row["state"] = row.get("state") or geo.get("state")
+
+        logger.info(
+            "Stage 2 pincode-direct lookup: resolved district/state for %d rows with existing pincodes.",
+            len(pincode_only_idx),
+        )
+
+    # --- Group B: Full spatial lat/lng lookup ---
+    if spatial_lookup_idx:
+        for start in range(0, len(spatial_lookup_idx), batch_size):
+            idx_slice = spatial_lookup_idx[start:start + batch_size]
+            batch = [rows[i] for i in idx_slice]
+            results = _enrich_batch(conn, cfg, batch, fallback_distance=fallback_distance)
+
+            for local_idx, global_idx in enumerate(idx_slice):
+                geo = results.get(local_idx)
+                if not geo:
+                    continue
+                row = rows[global_idx]
+                row["pincode"] = row.get("pincode") or geo.get("pincode")
+                row["district"] = row.get("district") or geo.get("district")
+                row["state"] = row.get("state") or geo.get("state")
 
     complete_count = sum(
         bool(row.get("pincode") and row.get("district") and row.get("state"))
