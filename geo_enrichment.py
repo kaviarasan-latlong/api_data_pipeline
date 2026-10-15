@@ -505,7 +505,11 @@ def enrich_rows(conn, cfg, rows: list[dict], fallback_distance: float = None):
     for row in rows:
         _normalize_source_geo_fields(row)
 
-    to_enrich_idx = [i for i, r in enumerate(rows) if _needs_enrichment(r)]
+    # Process all rows that have valid lat/lng coordinates
+    to_enrich_idx = [
+        i for i, r in enumerate(rows)
+        if r.get("lat") is not None and r.get("lng") is not None
+    ]
     if not to_enrich_idx:
         return rows
 
@@ -514,51 +518,24 @@ def enrich_rows(conn, cfg, rows: list[dict], fallback_distance: float = None):
 
     batch_size = cfg["geo_enrichment"].get("batch_size", 5000)
 
-    # --- Split into two groups ---
-    # Group A: already has pincode but missing district/state
-    #   → resolve directly from admin_area by pincode (no spatial lat/lng lookup)
-    # Group B: missing pincode entirely
-    #   → do full spatial lat/lng lookup via aa_geom
-    pincode_only_idx = [
-        i for i in to_enrich_idx
-        if rows[i].get("pincode") and not (rows[i].get("district") and rows[i].get("state"))
-    ]
-    spatial_lookup_idx = [
-        i for i in to_enrich_idx
-        if not rows[i].get("pincode")
-    ]
+    # Always use lat/long to lookup and update pincode, district, and state
+    for start in range(0, len(to_enrich_idx), batch_size):
+        idx_slice = to_enrich_idx[start:start + batch_size]
+        batch = [rows[i] for i in idx_slice]
+        results = _enrich_batch(conn, cfg, batch, fallback_distance=fallback_distance)
 
-    # --- Group A: Resolve district/state by pincode directly ---
-    if pincode_only_idx:
-        unique_pincodes = list({rows[i]["pincode"] for i in pincode_only_idx})
-        pincode_hierarchy = _resolve_hierarchy_by_pincode_bulk(conn, cfg, unique_pincodes)
-        for global_idx in pincode_only_idx:
+        for local_idx, global_idx in enumerate(idx_slice):
+            geo = results.get(local_idx)
+            if not geo:
+                continue
             row = rows[global_idx]
-            pc = row.get("pincode")
-            geo = pincode_hierarchy.get(pc, {})
-            row["district"] = row.get("district") or geo.get("district")
-            row["state"] = row.get("state") or geo.get("state")
-
-        logger.info(
-            "Stage 2 pincode-direct lookup: resolved district/state for %d rows with existing pincodes.",
-            len(pincode_only_idx),
-        )
-
-    # --- Group B: Full spatial lat/lng lookup ---
-    if spatial_lookup_idx:
-        for start in range(0, len(spatial_lookup_idx), batch_size):
-            idx_slice = spatial_lookup_idx[start:start + batch_size]
-            batch = [rows[i] for i in idx_slice]
-            results = _enrich_batch(conn, cfg, batch, fallback_distance=fallback_distance)
-
-            for local_idx, global_idx in enumerate(idx_slice):
-                geo = results.get(local_idx)
-                if not geo:
-                    continue
-                row = rows[global_idx]
-                row["pincode"] = row.get("pincode") or geo.get("pincode")
-                row["district"] = row.get("district") or geo.get("district")
-                row["state"] = row.get("state") or geo.get("state")
+            # Always update/overwrite with what we find from latlong spatial lookup
+            if geo.get("pincode"):
+                row["pincode"] = geo["pincode"]
+            if geo.get("district"):
+                row["district"] = geo["district"]
+            if geo.get("state"):
+                row["state"] = geo["state"]
 
     complete_count = sum(
         bool(row.get("pincode") and row.get("district") and row.get("state"))
@@ -572,7 +549,7 @@ def enrich_rows(conn, cfg, rows: list[dict], fallback_distance: float = None):
     unresolved_count = len(rows) - complete_count - partial_count
 
     logger.info(
-        "Stage 2 geo enrichment: %d/%d rows needed lookup; %d complete, "
+        "Stage 2 geo enrichment: %d/%d rows processed via latlong; %d complete, "
         "%d partial, %d unresolved geographic triplets.",
         len(to_enrich_idx), len(rows), complete_count, partial_count, unresolved_count,
     )
