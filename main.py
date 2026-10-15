@@ -281,9 +281,11 @@ def run():
                 enriched_rows = geo_enrichment.enrich_rows(conn, cfg, kept_rows)
             t_enrich = time.monotonic() - t0
 
-            # --- STAGE 3: Write (serialized for DB safety) ---
-            t0 = time.monotonic()
-            rows_to_write = [r for r in enriched_rows if r.get("pincode") and str(r.get("pincode")).strip()]
+            # Write all rows that have coordinates (even if pincode/district/state are NULL)
+            rows_to_write = [
+                r for r in enriched_rows
+                if r.get("lat") is not None and r.get("lng") is not None
+            ]
             writer.write_rows(conn, cfg, rows_to_write)
             t_write = time.monotonic() - t0
 

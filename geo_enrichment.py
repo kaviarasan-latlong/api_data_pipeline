@@ -545,7 +545,34 @@ def enrich_rows(conn, cfg, rows: list[dict], fallback_distance: float = 0.0):
         and not (row.get("pincode") and row.get("district") and row.get("state"))
         for row in rows
     )
-    unresolved_count = len(rows) - complete_count - partial_count
+    unresolved_rows = [
+        row for row in rows
+        if not (row.get("pincode") or row.get("district") or row.get("state"))
+    ]
+    unresolved_count = len(unresolved_rows)
+
+    if unresolved_rows:
+        error_dir = cfg.get("output", {}).get("report_dir")
+        if error_dir:
+            try:
+                import os, csv
+                os.makedirs(error_dir, exist_ok=True)
+                unresolved_file = os.path.join(error_dir, "unresolved_geo_rows.csv")
+                file_exists = os.path.isfile(unresolved_file)
+                with open(unresolved_file, "a", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f)
+                    if not file_exists:
+                        writer.writerow(["requestid", "api_type", "lat", "lng", "created_at"])
+                    for ur in unresolved_rows:
+                        writer.writerow([
+                            ur.get("requestid"),
+                            ur.get("api_type"),
+                            ur.get("lat"),
+                            ur.get("lng"),
+                            ur.get("created_at"),
+                        ])
+            except Exception as e:
+                logger.warning("Could not write unresolved rows to file: %s", e)
 
     logger.info(
         "Stage 2 geo enrichment: %d/%d rows processed via latlong; %d complete, "

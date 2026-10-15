@@ -55,8 +55,7 @@ def _rows_to_csv_buffer(rows: list[dict]) -> io.StringIO:
     buf = io.StringIO()
     writer = csv.writer(buf)
     for r in rows:
-        pincode = r.get("pincode")
-        if not pincode or not str(pincode).strip():
+        if r.get("lat") is None or r.get("lng") is None:
             continue
         writer.writerow([
             r.get("bunit_id"),
@@ -76,7 +75,7 @@ def _rows_to_csv_buffer(rows: list[dict]) -> io.StringIO:
 
 
 def write_rows(conn, cfg, rows: list[dict]):
-    rows = [r for r in rows if r.get("pincode") and str(r.get("pincode")).strip()]
+    rows = [r for r in rows if r.get("lat") is not None and r.get("lng") is not None]
     if not rows:
         return 0
 

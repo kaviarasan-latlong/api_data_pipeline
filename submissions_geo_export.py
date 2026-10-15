@@ -260,7 +260,7 @@ def _process_window(conn, start, end, source_config):
                     row.get("server_created_at"),
                 )
                 for row in enriched_rows
-                if row.get("pincode") and str(row.get("pincode")).strip()
+                if row.get("lat") is not None and row.get("lng") is not None
             ]
             _write_batch(conn, source_config["output_table"], pending)
             inserted_rows += len(pending)
