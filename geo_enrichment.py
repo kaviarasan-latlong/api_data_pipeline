@@ -501,7 +501,7 @@ def _enrich_batch(conn, cfg, batch: list[dict], fallback_distance: float = 0.0):
     return resolved
 
 
-def enrich_rows(conn, cfg, rows: list[dict], fallback_distance: float = None):
+def enrich_rows(conn, cfg, rows: list[dict], fallback_distance: float = 0.0):
     for row in rows:
         _normalize_source_geo_fields(row)
 
@@ -513,8 +513,7 @@ def enrich_rows(conn, cfg, rows: list[dict], fallback_distance: float = None):
     if not to_enrich_idx:
         return rows
 
-    if fallback_distance is None:
-        fallback_distance = float(cfg.get("geo_enrichment", {}).get("fallback_distance_meters", 500))
+    fallback_distance = float(fallback_distance or 0.0)
 
     batch_size = cfg["geo_enrichment"].get("batch_size", 5000)
 
