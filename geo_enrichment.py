@@ -418,31 +418,28 @@ def _enrich_batch(conn, cfg, batch: list[dict], fallback_distance: float = 0.0):
             LEFT JOIN LATERAL (
                 SELECT g.{geom_a_id_col} AS aa_id
                 FROM {geom_table} g
-                WHERE ST_Intersects(g.{geom_col}, pts.geom)
-                    AND {geom_filter_sql}
-                    AND EXISTS (
-                        SELECT 1 FROM {area_table} sa
-                        WHERE sa.{area_id_col} = g.{geom_a_id_col}
-                          AND sa.aa_order = 55
-                    )
+                JOIN {area_table} sa 
+                    ON sa.{area_id_col} = g.{geom_a_id_col} 
+                   AND sa.aa_order = 55
+                WHERE g.{geom_col} && pts.geom
+                  AND ST_Intersects(g.{geom_col}, pts.geom)
+                  AND {geom_filter_sql}
                 ORDER BY g.{geom_a_id_col}
                 LIMIT 1
             ) exact_match ON TRUE
             LEFT JOIN LATERAL (
                 SELECT g.{geom_a_id_col} AS aa_id
                 FROM {geom_table} g
+                JOIN {area_table} sa 
+                    ON sa.{area_id_col} = g.{geom_a_id_col} 
+                   AND sa.aa_order = 55
                 WHERE exact_match.aa_id IS NULL
-                    AND {geom_filter_sql}
-                    AND EXISTS (
-                        SELECT 1 FROM {area_table} sa
-                        WHERE sa.{area_id_col} = g.{geom_a_id_col}
-                          AND sa.aa_order = 55
-                    )
-                    AND g.{geom_col} && ST_Buffer(pts.geom::geography, {fallback_distance_sql})::geometry
-                    AND ST_Intersects(
-                        g.{geom_col},
-                        ST_Buffer(pts.geom::geography, {fallback_distance_sql})::geometry
-                    )
+                  AND {geom_filter_sql}
+                  AND g.{geom_col} && ST_Buffer(pts.geom::geography, {fallback_distance_sql})::geometry
+                  AND ST_Intersects(
+                      g.{geom_col},
+                      ST_Buffer(pts.geom::geography, {fallback_distance_sql})::geometry
+                  )
                 ORDER BY ST_Distance(g.{geom_col}::geography, pts.geom::geography),
                          g.{geom_a_id_col}
                 LIMIT 1
@@ -467,13 +464,12 @@ def _enrich_batch(conn, cfg, batch: list[dict], fallback_distance: float = 0.0):
             LEFT JOIN LATERAL (
                 SELECT g.{geom_a_id_col} AS aa_id
                 FROM {geom_table} g
-                WHERE ST_Intersects(g.{geom_col}, pts.geom)
-                    AND {geom_filter_sql}
-                    AND EXISTS (
-                        SELECT 1 FROM {area_table} sa
-                        WHERE sa.{area_id_col} = g.{geom_a_id_col}
-                          AND sa.aa_order = 55
-                    )
+                JOIN {area_table} sa 
+                    ON sa.{area_id_col} = g.{geom_a_id_col} 
+                   AND sa.aa_order = 55
+                WHERE g.{geom_col} && pts.geom
+                  AND ST_Intersects(g.{geom_col}, pts.geom)
+                  AND {geom_filter_sql}
                 ORDER BY g.{geom_a_id_col}
                 LIMIT 1
             ) exact_match ON TRUE
