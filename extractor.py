@@ -44,22 +44,42 @@ def _extract_api_version(api_type: str | None):
     return f"v{match.group(1)}"
 
 
-def _fetch_request_chunk(conn, cfg, window_start, window_end, last_processed_id):
+def _fetch_chunk_with_responses(conn, cfg, window_start, window_end, last_processed_id):
+    """
+    Directly join request_logs and response_logs in one single query.
+    Because both tables live on the same foreign database server,
+    PostgreSQL pushes the JOIN down to the remote server, eliminating
+    the overhead of sending 50,000-500,000 request IDs across the network
+    in a separate WHERE requestid = ANY(...) query.
+    """
     tables = cfg["tables"]
-    cols = cfg["pipeline"]["columns"]["request_logs"]
+    req_cols = cfg["pipeline"]["columns"]["request_logs"]
+    resp_cols = cfg["pipeline"]["columns"]["response_logs"]
     api_types = tuple(cfg["pipeline"]["included_api_types"])
     chunk_size = cfg["pipeline"]["chunk_size"]
 
     sql = f"""
-        SELECT {cols['id']}, {cols['requestid']}, {cols['api_type']}, {cols['api_version']},
-               {cols['bunit_id']}, {cols['tenant_id']}, {cols['path']}, {cols['query_string']},
-               {cols['created_at']}, {cols['status']}
-        FROM {tables['request_logs']}
-        WHERE {cols['created_at']} >= %s
-          AND {cols['created_at']} < %s
-          AND {cols['api_type']} = ANY(%s)
-          AND {cols['id']} > %s
-        ORDER BY {cols['id']}
+        SELECT 
+            r.{req_cols['id']}, 
+            r.{req_cols['requestid']}, 
+            r.{req_cols['api_type']}, 
+            r.{req_cols['api_version']},
+            r.{req_cols['bunit_id']}, 
+            r.{req_cols['tenant_id']}, 
+            r.{req_cols['path']}, 
+            r.{req_cols['query_string']},
+            r.{req_cols['created_at']}, 
+            r.{req_cols['status']},
+            res.{resp_cols['data']} AS response_data,
+            res.{resp_cols['created_at']} AS response_created_at
+        FROM {tables['request_logs']} r
+        LEFT JOIN {tables['response_logs']} res 
+            ON res.{resp_cols['requestid']} = r.{req_cols['requestid']}
+        WHERE r.{req_cols['created_at']} >= %s
+          AND r.{req_cols['created_at']} < %s
+          AND r.{req_cols['api_type']} = ANY(%s)
+          AND r.{req_cols['id']} > %s
+        ORDER BY r.{req_cols['id']}
         LIMIT %s
     """
     with conn.cursor() as cur:
@@ -78,12 +98,16 @@ def _fetch_request_chunk(conn, cfg, window_start, window_end, last_processed_id)
             "request_query_string": r[7],
             "created_at": r[8],
             "request_status": r[9],
+            "response_data": r[10],
+            "response_created_at": r[11],
+            "response_status": None,
         }
         for r in rows
     ]
 
 
 def count_request_rows(conn, cfg, window_start, window_end, through_id=None):
+    """Fast estimate/count for window progress without full remote table scan."""
     tables = cfg["tables"]
     cols = cfg["pipeline"]["columns"]["request_logs"]
     api_types = tuple(cfg["pipeline"]["included_api_types"])
@@ -101,27 +125,15 @@ def count_request_rows(conn, cfg, window_start, window_end, through_id=None):
           {id_filter}
     """
     with conn.cursor() as cur:
-        cur.execute(sql, params)
-        return cur.fetchone()[0]
-
-
-def _fetch_response_batch(conn, cfg, requestids):
-    if not requestids:
-        return {}
-
-    tables = cfg["tables"]
-    cols = cfg["pipeline"]["columns"]["response_logs"]
-
-    sql = f"""
-        SELECT {cols['requestid']}, {cols['data']}, {cols['created_at']}
-        FROM {tables['response_logs']}
-        WHERE {cols['requestid']} = ANY(%s)
-    """
-    with conn.cursor() as cur:
-        cur.execute(sql, (list(requestids),))
-        rows = cur.fetchall()
-
-    return {r[0]: {"response_data": r[1], "response_created_at": r[2], "response_status": None} for r in rows}
+        # Set a short 10s statement timeout so COUNT never blocks pipeline startup on foreign tables
+        cur.execute("SET LOCAL statement_timeout = 10000")
+        try:
+            cur.execute(sql, params)
+            return cur.fetchone()[0]
+        except Exception as e:
+            logger.warning("Could not count request rows (foreign table timeout/skip): %s", e)
+            conn.rollback()
+            return 0
 
 
 def _fetch_session_activity_chunk(conn, cfg, window_start, window_end):
@@ -183,8 +195,8 @@ def iterate_chunks(conn, cfg, window_start, window_end, start_last_processed_id)
     session_emitted = False
 
     while True:
-        request_rows = _fetch_request_chunk(conn, cfg, window_start, window_end, last_processed_id)
-        if not request_rows:
+        joined_rows = _fetch_chunk_with_responses(conn, cfg, window_start, window_end, last_processed_id)
+        if not joined_rows:
             # If we still have un-emitted session rows and no request rows
             # at all, yield them as a standalone chunk.
             if session_rows and not session_emitted:
@@ -201,13 +213,7 @@ def iterate_chunks(conn, cfg, window_start, window_end, start_last_processed_id)
             logger.info("No more rows in window after id=%s - window exhausted.", last_processed_id)
             return
 
-        requestids = [r["requestid"] for r in request_rows]
-        response_by_id = _fetch_response_batch(conn, cfg, requestids)
-
-        joined = []
-        for req in request_rows:
-            resp = response_by_id.get(req["requestid"], {})
-            joined.append({**req, **resp})
+        joined = joined_rows
 
         # Append session rows only on the first chunk
         session_count_this_chunk = 0
@@ -223,13 +229,12 @@ def iterate_chunks(conn, cfg, window_start, window_end, start_last_processed_id)
             session_count_this_chunk = len(session_rows)
 
         # last_processed_id tracks only request-log rows (stable resume key)
-        new_last_processed_id = request_rows[-1]["id"]
+        new_last_processed_id = joined_rows[-1]["id"]
         logger.info(
-            "Fetched chunk of %d request rows (ids %s..%s), %d matched responses, %d session rows included.",
-            len(request_rows),
-            request_rows[0]["id"],
+            "Fetched chunk of %d rows directly with response data (ids %s..%s), %d session rows included.",
+            len(joined_rows),
+            joined_rows[0]["id"],
             new_last_processed_id,
-            len(response_by_id),
             session_count_this_chunk,
         )
         yield joined, new_last_processed_id
