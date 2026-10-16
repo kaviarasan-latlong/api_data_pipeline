@@ -211,11 +211,19 @@ def run():
             pipeline_name, window_start, window_end, is_resume, last_processed_id,
         )
 
-        # For foreign tables with 30 crore rows, skip slow blocking COUNT(*)
-        total_request_rows = 0
-        completed_request_rows = 0
-        initial_progress_percent = 0.0
-        logger.info("Starting chunk streaming extraction for window %s -> %s...", window_start, window_end)
+        logger.info("Calculating total request rows for window %s -> %s...", window_start, window_end)
+        total_request_rows = extractor.count_request_rows(conn, cfg, window_start, window_end)
+        completed_request_rows = extractor.count_request_rows(
+            conn, cfg, window_start, window_end, through_id=last_processed_id,
+        )
+        initial_progress_percent = (
+            100.0 if total_request_rows == 0
+            else min(100.0, completed_request_rows * 100.0 / total_request_rows)
+        )
+        logger.info(
+            "Total request-log rows in window: %d; progress starts at %d/%d (%.1f%%).",
+            total_request_rows, completed_request_rows, total_request_rows, initial_progress_percent,
+        )
 
         totals = {"kept": 0, "dropped_error": 0, "dropped_no_latlong": 0}
         all_error_ids = []

@@ -192,6 +192,22 @@ def iterate_chunks(conn, cfg, window_start, window_end, start_last_processed_id)
     """
     last_processed_id = start_last_processed_id
 
+    # If starting a fresh window (last_processed_id == 0), fast-forward directly
+    # to the first ID in the window using the created_at index instead of scanning
+    # 30 crore rows from ID 0.
+    if last_processed_id == 0:
+        tables = cfg["tables"]
+        req_cols = cfg["pipeline"]["columns"]["request_logs"]
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT {req_cols['id']} FROM {tables['request_logs']} WHERE {req_cols['created_at']} >= %s ORDER BY {req_cols['created_at']} ASC LIMIT 1",
+                (window_start,),
+            )
+            min_row = cur.fetchone()
+            if min_row and min_row[0]:
+                last_processed_id = min_row[0] - 1
+                logger.info("Fast-forwarded initial chunk start ID to %s using created_at index.", last_processed_id)
+
     # --- Fetch session rows exactly once for the whole window ---
     session_rows = _fetch_session_activity_chunk(conn, cfg, window_start, window_end)
     if session_rows:

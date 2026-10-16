@@ -218,19 +218,32 @@ def _resolve_hierarchy_by_pincode_bulk(conn, cfg, pincodes: list):
     return results
 
 
-# ---------------------------------------------------------------------------
-# Bulk admin hierarchy resolution via recursive CTE
-# ---------------------------------------------------------------------------
+# Module-level cache: { area_id: {"pincode": ..., "district": ..., "state": ...} }
+_hierarchy_cache: dict[int, dict] = {}
+
 
 def _resolve_admin_hierarchy_bulk(conn, cfg, area_ids: list):
     """
     Resolve pincode/district/state for MULTIPLE area_ids in a single
     recursive CTE query, replacing the old per-row iterative approach.
+    Uses in-memory cache so repeated area_ids across chunks hit RAM directly.
 
     Returns {area_id: {"pincode": ..., "district": ..., "state": ...}}
     """
     if not area_ids:
         return {}
+
+    # Check cache first
+    cached_results = {}
+    missing_ids = set()
+    for aid in area_ids:
+        if aid in _hierarchy_cache:
+            cached_results[aid] = _hierarchy_cache[aid]
+        else:
+            missing_ids.add(aid)
+
+    if not missing_ids:
+        return cached_results
 
     area_cols = cfg["geo_enrichment"]["area_table_columns"]
     parent_col = area_cols.get("parent_id", "aa_in_aa_id")
@@ -241,8 +254,7 @@ def _resolve_admin_hierarchy_bulk(conn, cfg, area_ids: list):
     has_aa_order = schema_info.get("aa_order", False)
     has_to_date = schema_info.get("to_date", False)
 
-    # Deduplicate area_ids to avoid redundant work
-    unique_ids = list(set(area_ids))
+    unique_ids = list(missing_ids)
 
     # Build the recursive CTE that walks the full parent chain for all
     # start IDs in one shot, up to depth 10 (pincode -> district -> state
@@ -329,15 +341,19 @@ def _resolve_admin_hierarchy_bulk(conn, cfg, area_ids: list):
                 break
 
         if pincode:
-            results[start_id] = {
+            res = {
                 "pincode": pincode,
                 "district": district,
                 "state": state,
             }
         else:
-            results[start_id] = {"pincode": None, "district": None, "state": None}
+            res = {"pincode": None, "district": None, "state": None}
 
-    return results
+        results[start_id] = res
+        _hierarchy_cache[start_id] = res
+
+    cached_results.update(results)
+    return cached_results
 
 
 # ---------------------------------------------------------------------------
@@ -360,9 +376,19 @@ def _enrich_batch(conn, cfg, batch: list[dict], fallback_distance: float = 0.0):
     geom_schema = _table_has_columns(conn, geom_table, ["to_date", "aa_order"])
     area_schema = _table_has_columns(conn, area_table, ["to_date"])
 
-    idxs = list(range(len(batch)))
-    lats = [r["lat"] for r in batch]
-    lngs = [r["lng"] for r in batch]
+    # Deduplicate coordinates in Python to avoid running heavy ST_Intersects on duplicate points
+    coord_to_indices = {}
+    for i, r in enumerate(batch):
+        coord_key = (round(float(r["lat"]), 6), round(float(r["lng"]), 6))
+        if coord_key not in coord_to_indices:
+            coord_to_indices[coord_key] = []
+        coord_to_indices[coord_key].append(i)
+
+    # Unique points for SQL execution
+    unique_points = list(coord_to_indices.keys())
+    idxs = list(range(len(unique_points)))
+    lats = [pt[0] for pt in unique_points]
+    lngs = [pt[1] for pt in unique_points]
 
     geom_where = []
     if geom_schema.get("to_date", False):
@@ -457,15 +483,20 @@ def _enrich_batch(conn, cfg, batch: list[dict], fallback_distance: float = 0.0):
         cur.execute(sql, (idxs, lats, lngs))
         results = cur.fetchall()
 
-    # Collect the first matching area_id per row index
+    # Map results back to ALL original row indices (handling duplicates)
     by_idx = {}
     fallback_matches = 0
     for row in results:
-        idx = row[0]
-        if idx not in by_idx:
-            by_idx[idx] = row[1]
-        if row[2] == "buffer":
-            fallback_matches += 1
+        pt_idx = row[0]
+        matched_aa_id = row[1]
+        is_buffer = (row[2] == "buffer")
+        
+        orig_indices = coord_to_indices.get(unique_points[pt_idx], [])
+        for orig_idx in orig_indices:
+            if matched_aa_id is not None:
+                by_idx[orig_idx] = matched_aa_id
+            if is_buffer:
+                fallback_matches += 1
 
     if fallback_matches:
         logger.info(
