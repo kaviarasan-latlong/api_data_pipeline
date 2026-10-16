@@ -422,9 +422,8 @@ def _enrich_batch(conn, cfg, batch: list[dict], fallback_distance: float = 0.0):
                     ON sa.{area_id_col} = g.{geom_a_id_col} 
                    AND sa.aa_order = 55
                 WHERE g.{geom_col} && pts.geom
-                  AND ST_Intersects(g.{geom_col}, pts.geom)
+                  AND ST_Contains(g.{geom_col}, pts.geom)
                   AND {geom_filter_sql}
-                ORDER BY g.{geom_a_id_col}
                 LIMIT 1
             ) exact_match ON TRUE
             LEFT JOIN LATERAL (
@@ -440,8 +439,7 @@ def _enrich_batch(conn, cfg, batch: list[dict], fallback_distance: float = 0.0):
                       g.{geom_col},
                       ST_Buffer(pts.geom::geography, {fallback_distance_sql})::geometry
                   )
-                ORDER BY ST_Distance(g.{geom_col}::geography, pts.geom::geography),
-                         g.{geom_a_id_col}
+                ORDER BY ST_Distance(g.{geom_col}::geography, pts.geom::geography)
                 LIMIT 1
             ) nearby_match ON TRUE
             ORDER BY pts.idx
@@ -468,9 +466,8 @@ def _enrich_batch(conn, cfg, batch: list[dict], fallback_distance: float = 0.0):
                     ON sa.{area_id_col} = g.{geom_a_id_col} 
                    AND sa.aa_order = 55
                 WHERE g.{geom_col} && pts.geom
-                  AND ST_Intersects(g.{geom_col}, pts.geom)
+                  AND ST_Contains(g.{geom_col}, pts.geom)
                   AND {geom_filter_sql}
-                ORDER BY g.{geom_a_id_col}
                 LIMIT 1
             ) exact_match ON TRUE
             ORDER BY pts.idx
