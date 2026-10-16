@@ -124,16 +124,14 @@ def count_request_rows(conn, cfg, window_start, window_end, through_id=None):
           AND {cols['api_type']} = ANY(%s)
           {id_filter}
     """
-    with conn.cursor() as cur:
-        # Set a short 10s statement timeout so COUNT never blocks pipeline startup on foreign tables
-        cur.execute("SET LOCAL statement_timeout = 10000")
-        try:
+    try:
+        with conn.cursor() as cur:
             cur.execute(sql, params)
             return cur.fetchone()[0]
-        except Exception as e:
-            logger.warning("Could not count request rows (foreign table timeout/skip): %s", e)
-            conn.rollback()
-            return 0
+    except Exception as e:
+        logger.warning("Could not count request rows (skipping progress count): %s", e)
+        conn.rollback()
+        return 0
 
 
 def _fetch_session_activity_chunk(conn, cfg, window_start, window_end):
@@ -149,9 +147,15 @@ def _fetch_session_activity_chunk(conn, cfg, window_start, window_end):
           AND created_at >= %s
           AND created_at < %s
     """
-    with conn.cursor() as cur:
-        cur.execute(sql, (list(session_api_types), window_start, window_end))
-        rows = cur.fetchall()
+    rows = []
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, (list(session_api_types), window_start, window_end))
+            rows = cur.fetchall()
+    except Exception as e:
+        logger.warning("Could not fetch session_activities for window (skipped): %s", e)
+        conn.rollback()
+        return []
 
     result = []
     for row in rows:
