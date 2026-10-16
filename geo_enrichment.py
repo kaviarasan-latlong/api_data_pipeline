@@ -387,30 +387,31 @@ def _enrich_batch(conn, cfg, batch: list[dict], fallback_distance: float = 0.0):
                        WHEN exact_match.aa_id IS NOT NULL THEN 'exact'
                        WHEN nearby_match.aa_id IS NOT NULL THEN 'buffer'
                        ELSE NULL
-                   END AS match_type,
-                   a.{area_id_col},
-                   a.{display_name_col},
-                   a.{parent_id_col}
+                   END AS match_type
             FROM pts
             LEFT JOIN LATERAL (
                 SELECT g.{geom_a_id_col} AS aa_id
                 FROM {geom_table} g
-                JOIN {area_table} sub_a ON sub_a.{area_id_col} = g.{geom_a_id_col}
                 WHERE ST_Intersects(g.{geom_col}, pts.geom)
                     AND {geom_filter_sql}
-                    AND sub_a.aa_order = 55
-                    {area_filter_sql.replace('a.', 'sub_a.')}
+                    AND EXISTS (
+                        SELECT 1 FROM {area_table} sa
+                        WHERE sa.{area_id_col} = g.{geom_a_id_col}
+                          AND sa.aa_order = 55
+                    )
                 ORDER BY g.{geom_a_id_col}
                 LIMIT 1
             ) exact_match ON TRUE
             LEFT JOIN LATERAL (
                 SELECT g.{geom_a_id_col} AS aa_id
                 FROM {geom_table} g
-                JOIN {area_table} sub_a ON sub_a.{area_id_col} = g.{geom_a_id_col}
                 WHERE exact_match.aa_id IS NULL
                     AND {geom_filter_sql}
-                    AND sub_a.aa_order = 55
-                    {area_filter_sql.replace('a.', 'sub_a.')}
+                    AND EXISTS (
+                        SELECT 1 FROM {area_table} sa
+                        WHERE sa.{area_id_col} = g.{geom_a_id_col}
+                          AND sa.aa_order = 55
+                    )
                     AND g.{geom_col} && ST_Buffer(pts.geom::geography, {fallback_distance_sql})::geometry
                     AND ST_Intersects(
                         g.{geom_col},
@@ -420,9 +421,6 @@ def _enrich_batch(conn, cfg, batch: list[dict], fallback_distance: float = 0.0):
                          g.{geom_a_id_col}
                 LIMIT 1
             ) nearby_match ON TRUE
-            LEFT JOIN {area_table} a
-                ON a.{area_id_col} = COALESCE(exact_match.aa_id, nearby_match.aa_id)
-                {area_filter_sql}
             ORDER BY pts.idx
         """
     else:
@@ -438,25 +436,21 @@ def _enrich_batch(conn, cfg, batch: list[dict], fallback_distance: float = 0.0):
                    CASE
                        WHEN exact_match.aa_id IS NOT NULL THEN 'exact'
                        ELSE NULL
-                   END AS match_type,
-                   a.{area_id_col},
-                   a.{display_name_col},
-                   a.{parent_id_col}
+                   END AS match_type
             FROM pts
             LEFT JOIN LATERAL (
                 SELECT g.{geom_a_id_col} AS aa_id
                 FROM {geom_table} g
-                JOIN {area_table} sub_a ON sub_a.{area_id_col} = g.{geom_a_id_col}
                 WHERE ST_Intersects(g.{geom_col}, pts.geom)
                     AND {geom_filter_sql}
-                    AND sub_a.aa_order = 55
-                    {area_filter_sql.replace('a.', 'sub_a.')}
+                    AND EXISTS (
+                        SELECT 1 FROM {area_table} sa
+                        WHERE sa.{area_id_col} = g.{geom_a_id_col}
+                          AND sa.aa_order = 55
+                    )
                 ORDER BY g.{geom_a_id_col}
                 LIMIT 1
             ) exact_match ON TRUE
-            LEFT JOIN {area_table} a
-                ON a.{area_id_col} = exact_match.aa_id
-                {area_filter_sql}
             ORDER BY pts.idx
         """
     with conn.cursor() as cur:
